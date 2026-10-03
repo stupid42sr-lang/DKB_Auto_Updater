@@ -1,0 +1,9 @@
+{
+  "runtime_version": "1.1.0",
+  "project": "DKB",
+  "files": {
+    "updater.py": "1e42748ef3e2a57e04168b9aa49ba408fe5ef8c385bcf845a5d93cb996e249c2",
+    "update.cmd": "e97d9d09a127c3e7216203b83ceb8284d022b6f3dafcb7e9b89004afd0eb2342",
+    "update-config.json": "d26467c357d908c934d2aabf5811a4670ed8fd4e7b3b95890d9bceba0de82b12"
+  }
+}

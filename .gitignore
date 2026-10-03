@@ -1,0 +1,11 @@
+license.dat
+**/license.dat
+*.pem
+*.key
+.env*
+__pycache__/
+*.pyc
+dist/
+downloads/
+*.zip
+*.update-*
