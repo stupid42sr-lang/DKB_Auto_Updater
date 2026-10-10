@@ -1,7 +1,8 @@
 Public distribution repository for DKB only.
 Project sources live in the Private DKB_Auto repository.
-Release assets contain only project payloads, manifests and SHA256SUMS.txt.
-Shared Base/Runtime/Python/DLL/models and user credentials/settings are not bundled.
+Initial Full contains versioned sibling project/Base/Runtime/engine4/updater folders.
+Subsequent releases contain changed-file deltas, manifests and SHA256SUMS.txt.
+Real user credentials/settings are never bundled; Full provides an empty license.dat.
 
 update.cmd --install C:\Vampire\DKB_Auto --github --check
 update.cmd --install C:\Vampire\DKB_Auto --github
@@ -13,4 +14,6 @@ Keep the app closed while updating. The existing project mutex is checked.
 Only matching-baseline deltas apply. Unknown/local edits block updates.
 User license/settings/logs remain untouched. Rollback backup is retained until --finish.
 Draft development releases may be selected because allow_prerelease is explicit in config.
-The current Runtime stays pinned; a Runtime change is a separate install/release.
+For bundled installations, managed component changes use the same SHA256/rollback flow.
+Skipped releases use matching intermediate deltas; no automatic Full download.
+Packaged updater runs from temporary embedded Python so installed DLLs can be replaced.
