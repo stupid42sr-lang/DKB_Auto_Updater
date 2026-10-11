@@ -12,10 +12,27 @@ import tempfile
 import urllib.request
 import urllib.parse
 import re
+import io
+import sys
 from contextlib import contextmanager
 
 BUNDLE_CONTRACT='biol-dkb-distribution-v1'
 BUNDLE_MANIFEST='distribution-manifest.json'
+_progress_callback = None
+
+
+def set_progress_callback(callback):
+    global _progress_callback
+    _progress_callback = callback
+
+
+def report_progress(message):
+    if _progress_callback is not None:
+        _progress_callback(message)
+
+
+def files_baseline(files):
+    return hashlib.sha256(json.dumps(files,sort_keys=True,separators=(',', ':')).encode()).hexdigest()
 
 
 def managed_root(install):
@@ -98,6 +115,7 @@ def apply(install, archive, expected_sha256):
     backup = install.with_name(install.name + '.update-backup')
     stage = install.with_name(install.name + '.update-stage')
     lock = install.with_name(install.name + '.update-lock')
+    report_progress('다운로드 파일 검증 중...')
     if digest(archive) != expected_sha256:
         raise ValueError('ZIP SHA256 mismatch; installation unchanged')
     if backup.exists() or stage.exists():
@@ -113,6 +131,8 @@ def apply(install, archive, expected_sha256):
             names = z.namelist()
             if len({n.casefold() for n in names}) != len(names): raise ValueError('Duplicate ZIP paths')
             new = json.loads(z.read(marker))
+            if new.get('update_base_files_sha256') is not None and new['update_base_files_sha256']!=files_baseline(old['files']):
+                raise ValueError('Installed baseline changed after download')
             if bundle and (new.get('contract')!=BUNDLE_CONTRACT or new.get('app_dir')!='DKB_Auto'):raise ValueError('Invalid bundle update')
             if old['project'] != new['project']: raise ValueError('Project mismatch')
             if any(user_file(n) for n in new['files']) or any(user_file(n) for n in new.get('removed', [])):
@@ -129,25 +149,42 @@ def apply(install, archive, expected_sha256):
                 if n != marker and n not in new['files']: raise ValueError('Unlisted ZIP file')
             removed = {n for n in set(old['files']) - set(new['files']) if not user_file(n)}
             if removed != set(new.get('removed', [])): raise ValueError('Deletion manifest mismatch')
+            report_progress('현재 설치 파일 검증 중...')
             for n, h in old['files'].items():
                 if user_file(n): continue
                 p = safe(install, n)
                 if not p.is_file() or digest(p) != h: raise ValueError('Local managed file changed: ' + n)
             # Reject reparse links; staging must never write outside this installation.
+            report_progress('설치 경로 확인 중...')
             if any(p.is_symlink() or (getattr(p.lstat(), 'st_file_attributes', 0) & 1024)
                    for p in install.rglob('*')): raise ValueError('Linked installation unsupported')
-            shutil.copytree(install, stage)
+            report_progress('복구용 설치본 준비 중...')
+            def stage_file(source,target):
+                name=Path(source).relative_to(install).as_posix()
+                # Unchanged managed files share bytes only; never write through
+                # these links. User files keep the original independent copy.
+                if bundle and name in old['files'] and not user_file(name):
+                    try:os.link(source,target);return target
+                    except OSError:pass
+                return shutil.copy2(source,target)
+            shutil.copytree(install, stage,copy_function=stage_file)
             for n in removed: safe(stage, n).unlink()
+            report_progress('변경 파일 적용 중...')
             for n in names:
                 if n == 'license.dat': continue
                 target = safe(stage, n)
                 if n not in old['files'] and n != marker and target.exists():
                     raise ValueError('Unmanaged file collision: ' + n)
                 target.parent.mkdir(parents=True, exist_ok=True)
+                # Break any staging hard link before replacing managed bytes.
+                target.unlink(missing_ok=True)
                 target.write_bytes(z.read(n))
+            report_progress('업데이트 파일 검증 중...')
             for n, h in new['files'].items():
+                if bundle and old['files'].get(n)==h and n not in names:continue
                 p = safe(stage, n)
                 if not p.is_file() or digest(p) != h: raise ValueError('File SHA256 mismatch: ' + n)
+        report_progress('설치본 교체 중...')
         os.replace(install, backup)
         try:
             os.replace(stage, install)
@@ -157,9 +194,19 @@ def apply(install, archive, expected_sha256):
             raise
         # Keep the previous version until explicit finish/recover.
         return 'Applied and verified; previous version retained at ' + str(backup)
+    except Exception as exc:
+        report_progress('업데이트 적용 실패: '+str(exc))
+        raise
     finally:
-        if not swapped and stage.exists(): shutil.rmtree(stage)
-        lock.unlink(missing_ok=True)
+        failing=sys.exc_info()[0] is not None
+        try:
+            if not swapped and stage.exists():
+                report_progress('실패한 임시 설치본 정리 중...')
+                shutil.rmtree(stage)
+            lock.unlink(missing_ok=True)
+        except OSError as exc:
+            report_progress('임시 설치본 정리 실패: '+str(exc))
+            if not failing:raise
 
 
 def recover(install):
@@ -252,6 +299,59 @@ def version_key(value):
     return (int(match[1]),int(match[2]),int(match[3]),pre)
 
 
+class RemoteDelta(io.RawIOBase):
+    """Read ZIP directory and selected compressed entries, never a Full asset."""
+    def __init__(self,url):
+        super().__init__()
+        if urllib.parse.urlparse(url).scheme!='https':raise ValueError('HTTPS required')
+        self.url=url;self.position=0;self.length=None
+        self._range(0,0)
+
+    def _range(self,start,end):
+        if _cancel_event is not None and _cancel_event.is_set():raise InterruptedError('Update cancelled')
+        req=urllib.request.Request(self.url,headers={'User-Agent':'BIOL-DKB-Updater/1.0',
+            'Range':f'bytes={start}-{end}','Accept-Encoding':'identity'})
+        with urllib.request.urlopen(req,timeout=3 if _cancel_event is not None else 60) as response:
+            if urllib.parse.urlparse(response.url).scheme!='https':raise ValueError('Insecure redirect')
+            match=re.fullmatch(r'bytes (\d+)-(\d+)/(\d+)',response.headers.get('Content-Range',''))
+            if response.status!=206 or not match or (int(match[1]),int(match[2]))!=(start,end):
+                raise RuntimeError('Delta server does not support selective download; Full download refused')
+            length=int(match[3])
+            if self.length is not None and self.length!=length:raise ValueError('Remote delta changed')
+            self.length=length
+            data=response.read(end-start+2)
+            if len(data)!=end-start+1:raise ValueError('Incomplete delta range')
+            return data
+
+    def seekable(self):return True
+    def readable(self):return True
+    def tell(self):return self.position
+    def seek(self,offset,whence=0):
+        position=offset if whence==0 else self.position+offset if whence==1 else self.length+offset
+        if position<0:raise ValueError('Negative ZIP offset')
+        self.position=position;return position
+    def read(self,size=-1):
+        if self.position>=self.length:return b''
+        end=self.length-1 if size<0 else min(self.length-1,self.position+size-1)
+        if end<self.position:return b''
+        data=self._range(self.position,end);self.position=end+1;return data
+
+
+def release_documents(release,cfg):
+    assets={a['name']:a['browser_download_url'] for a in release['assets']}
+    meta=json.loads(download(assets['release.json']))
+    if (meta.get('contract'),meta.get('project'),meta.get('repository'),meta.get('tag'))!=(
+            'biol-project-update-v1',cfg['project'],cfg['repository'],release['tag_name']):
+        raise ValueError('Release identity mismatch')
+    if version_key(meta['version'])!=version_key(release['tag_name']):raise ValueError('Release version mismatch')
+    data=download(assets['package-manifest.json'])
+    if hashlib.sha256(data).hexdigest()!=meta['package_manifest_sha256']:raise ValueError('Release manifest SHA256 mismatch')
+    manifest=json.loads(data)
+    if manifest['project']!=cfg['project'] or manifest['runtime_version']!=meta['runtime_version']:
+        raise ValueError('Release manifest identity mismatch')
+    return meta,manifest,assets
+
+
 def inspect_release(install):
     """Read-only structured check; safe while the app holds its instance mutex."""
     cfg = json.loads(Path(__file__).with_name('update-config.json').read_text(encoding='utf-8'))
@@ -290,23 +390,12 @@ def inspect_release(install):
     baseline = {p: h for p, h in old['files'].items() if not user_file(p)}
     actual = hashlib.sha256(json.dumps(baseline, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
     if actual != meta['base_files_sha256']:
-        # Do not download Full when releases were skipped. Find the next
-        # published delta matching this installation's exact baseline.
         if bundle:
-            for candidate in sorted(choices,key=lambda r:version_key(r['tag_name'])):
-                if not version_key(current)<version_key(candidate['tag_name'])<version_key(meta['version']):continue
-                candidate_assets={a['name']:a['browser_download_url'] for a in candidate['assets']}
-                cm=json.loads(download(candidate_assets['release.json']))
-                if (cm.get('contract'),cm.get('distribution_contract'),cm.get('project'),cm.get('repository'),cm.get('tag'))!=(
-                        'biol-project-update-v1',BUNDLE_CONTRACT,cfg['project'],cfg['repository'],candidate['tag_name']):raise ValueError('Intermediate release identity mismatch')
-                if cm.get('base_files_sha256')!=actual:continue
-                cbytes=download(candidate_assets['package-manifest.json'])
-                if hashlib.sha256(cbytes).hexdigest()!=cm['package_manifest_sha256']:raise ValueError('Intermediate manifest SHA256 mismatch')
-                cn=json.loads(cbytes)
-                if cn.get('contract')!=BUNDLE_CONTRACT or cn.get('project')!=cfg['project'] or cn.get('app_dir')!='DKB_Auto':raise ValueError('Intermediate bundle identity mismatch')
-                return dict(result,state='available',version=cm['version'],metadata=cm,
-                            assets=candidate_assets,manifest_sha256=cm['package_manifest_sha256'],
-                            latest_version=meta['version'])
+            if new.get('app_dir')!='DKB_Auto':raise ValueError('Invalid latest bundle identity')
+            # Intermediate ZIPs are file sources only; install latest once.
+            return dict(result,state='available',direct_delta=True,target_manifest=new,
+                release_candidates=[{'tag_name':r['tag_name'],'assets':r['assets']} for r in choices
+                    if version_key(current)<version_key(r['tag_name'])<=version_key(meta['version'])])
         return dict(result,state='baseline_mismatch')
     return dict(result,state='available')
 
@@ -318,6 +407,8 @@ def prepare_update(install):
     if any(root.with_name(root.name+suffix).exists() for suffix in ('.update-backup','.update-stage','.update-lock')):
         raise RuntimeError('Previous update pending; inspect before applying')
     meta=result['metadata']
+    if result.get('direct_delta'):
+        return prepare_direct_delta(install,result)
     data=download(result['assets'][meta['delta']['name']])
     if hashlib.sha256(data).hexdigest()!=meta['delta']['sha256']:raise ValueError('ZIP SHA256 mismatch')
     folder=Path(tempfile.mkdtemp(prefix='biol-project-delta-'))
@@ -329,6 +420,43 @@ def prepare_update(install):
             if hashlib.sha256(z.read(marker)).hexdigest()!=result['manifest_sha256']:
                 raise ValueError('Delta manifest SHA256 mismatch')
         return dict(result,archive=str(archive),download_dir=str(folder),sha256=meta['delta']['sha256'])
+    except BaseException:
+        shutil.rmtree(folder);raise
+
+
+def prepare_direct_delta(install,result):
+    old=installed_manifest(install);new=dict(result['target_manifest'])
+    needed={n:h for n,h in new['files'].items() if old['files'].get(n)!=h}
+    new['removed']=sorted(set(old['files'])-set(new['files']))
+    new['update_base_files_sha256']=files_baseline(old['files'])
+    if any(user_file(n) for n in (*new['files'],*new['removed'])):
+        raise ValueError('User files cannot be updated or deleted')
+    folder=Path(tempfile.mkdtemp(prefix='biol-project-delta-'));archive=folder/'update.zip'
+    cfg=json.loads(Path(__file__).with_name('update-config.json').read_text(encoding='utf-8'))
+    try:
+        with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED) as output:
+            for candidate in sorted(result['release_candidates'],key=lambda r:version_key(r['tag_name']),reverse=True):
+                if not needed:break
+                cm,cn,assets=release_documents(candidate,cfg)
+                if cn.get('contract')!=BUNDLE_CONTRACT or cn.get('app_dir')!='DKB_Auto':
+                    raise ValueError('Invalid delta source bundle')
+                matching={n for n,h in needed.items() if cn['files'].get(n)==h}
+                if not matching:continue
+                with RemoteDelta(assets[cm['delta']['name']]) as remote,zipfile.ZipFile(remote) as source:
+                    names=source.namelist()
+                    if len({n.casefold() for n in names})!=len(names):raise ValueError('Duplicate ZIP paths')
+                    if hashlib.sha256(source.read(BUNDLE_MANIFEST)).hexdigest()!=cm['package_manifest_sha256']:
+                        raise ValueError('Delta manifest SHA256 mismatch')
+                    for name in sorted(matching.intersection(names)):
+                        safe(folder,name)
+                        report_progress('변경 파일 다운로드: '+name)
+                        data=source.read(name)
+                        if hashlib.sha256(data).hexdigest()!=needed[name]:raise ValueError('Delta file SHA256 mismatch: '+name)
+                        output.writestr(name,data);del needed[name]
+            if needed:raise ValueError('Required latest files unavailable in published deltas: '+', '.join(sorted(needed)))
+            output.writestr(BUNDLE_MANIFEST,json.dumps(new,ensure_ascii=False,indent=2).encode('utf-8'))
+        prepared={k:v for k,v in result.items() if k not in ('target_manifest','release_candidates')}
+        return dict(prepared,archive=str(archive),download_dir=str(folder),sha256=digest(archive))
     except BaseException:
         shutil.rmtree(folder);raise
 
