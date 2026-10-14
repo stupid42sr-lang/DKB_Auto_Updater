@@ -93,6 +93,7 @@ def prepare_workspace(install):
         try:accepted=json.loads(receipt.read_text(encoding='utf-8'))['manifest_sha256']==digest(install/BUNDLE_MANIFEST)
         except (OSError,ValueError,KeyError):pass
         if not accepted or legacy[0].exists():verify_installed(install)
+        if accepted:prune_history(install)
         history=backup.parent/'history';history.mkdir(exist_ok=True)
         for path in retained:
             old=json.loads((path/BUNDLE_MANIFEST).read_text(encoding='utf-8'))
@@ -105,12 +106,46 @@ def prepare_workspace(install):
         os.replace(legacy_log,logs/('legacy-'+uuid.uuid4().hex+'.log'))
 
 
+def prune_history(install):
+    """Remove only completed DKB history; preserve the current rollback backup."""
+    install=managed_root(install)
+    backup,stage,lock=workspace(install)
+    if backup.parent!=install/'.update':return
+    if stage.exists() or lock.exists() or (backup.parent/'transaction.json').exists():return
+    history=backup.parent/'history'
+    if not history.exists():return
+    def linked(path):
+        return path.is_symlink() or bool(getattr(path.lstat(),'st_file_attributes',0)&1024)
+    try:
+        if linked(history) or history.resolve().parent!=backup.parent.resolve():
+            raise ValueError('Linked history directory unsupported')
+        for path in history.iterdir():
+            if not path.name.startswith('backup-'):continue
+            try:
+                if linked(path) or path.resolve().parent!=history.resolve() or not path.is_dir():
+                    raise ValueError('Invalid history backup path')
+                old=json.loads((path/BUNDLE_MANIFEST).read_text(encoding='utf-8'))
+                if old.get('contract')!=BUNDLE_CONTRACT or old.get('project')!='DKB':
+                    raise ValueError('Invalid history backup identity')
+                # Refuse junctions throughout the tree before recursive removal.
+                for home,dirs,files in os.walk(path,followlinks=False):
+                    if any(linked(Path(home)/name) for name in (*dirs,*files)):
+                        raise ValueError('Linked history backup contents unsupported')
+                report_progress('과거 업데이트 백업 정리 중...')
+                shutil.rmtree(path)
+            except (OSError,ValueError) as exc:
+                report_progress('과거 백업 정리 보류 · '+path.name+' · '+str(exc))
+    except (OSError,ValueError) as exc:
+        report_progress('과거 업데이트 백업 정리 보류 · '+str(exc))
+
+
 def accept(install):
     """Restart acknowledged; retain rollback without blocking the next update."""
     install=managed_root(install)
     if not (install/BUNDLE_MANIFEST).is_file():return
     backup,stage,lock=workspace(install)
     (backup.parent/'accepted.json').write_text(json.dumps({'manifest_sha256':digest(install/BUNDLE_MANIFEST)}),encoding='utf-8')
+    prune_history(install)
 
 
 def swap_payload(install,source,backup):
