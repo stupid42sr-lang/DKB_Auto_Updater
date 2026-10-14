@@ -15,6 +15,7 @@ import re
 import io
 import sys
 import uuid
+import ssl
 from contextlib import contextmanager
 
 BUNDLE_CONTRACT='biol-dkb-distribution-v1'
@@ -386,6 +387,22 @@ def finish(install):
 
 
 _cancel_event = None
+_ssl_context = None
+
+
+def update_ssl_context():
+    """Keep OS trust and add the CA bundle already shipped in the Runtime."""
+    global _ssl_context
+    if _ssl_context is None:
+        context=ssl.create_default_context()
+        try:
+            import certifi
+        except ImportError:
+            pass  # Standalone use retains the existing verified OS trust path.
+        else:
+            context.load_verify_locations(cafile=certifi.where())
+        _ssl_context=context
+    return _ssl_context
 
 def set_cancel_event(event):
     """GUI-owned checks/downloads are cancelled when their owner exits."""
@@ -400,7 +417,7 @@ def download(url):
     if urllib.parse.urlparse(url).scheme != 'https':
         raise ValueError('HTTPS download required')
     req = urllib.request.Request(url, headers={'User-Agent': 'BIOL-DKB-Updater/1.0', 'Accept': 'application/vnd.github+json'})
-    with urllib.request.urlopen(req, timeout=3 if _cancel_event is not None else 60) as response:
+    with urllib.request.urlopen(req, timeout=3 if _cancel_event is not None else 60,context=update_ssl_context()) as response:
         if urllib.parse.urlparse(response.url).scheme != 'https':
             raise ValueError('Insecure redirect rejected')
         chunks=[]
@@ -433,7 +450,7 @@ class RemoteDelta(io.RawIOBase):
         if _cancel_event is not None and _cancel_event.is_set():raise InterruptedError('Update cancelled')
         req=urllib.request.Request(self.url,headers={'User-Agent':'BIOL-DKB-Updater/1.0',
             'Range':f'bytes={start}-{end}','Accept-Encoding':'identity'})
-        with urllib.request.urlopen(req,timeout=3 if _cancel_event is not None else 60) as response:
+        with urllib.request.urlopen(req,timeout=3 if _cancel_event is not None else 60,context=update_ssl_context()) as response:
             if urllib.parse.urlparse(response.url).scheme!='https':raise ValueError('Insecure redirect')
             match=re.fullmatch(r'bytes (\d+)-(\d+)/(\d+)',response.headers.get('Content-Range',''))
             if response.status!=206 or not match or (int(match[1]),int(match[2]))!=(start,end):
