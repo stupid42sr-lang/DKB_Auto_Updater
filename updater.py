@@ -93,10 +93,24 @@ def prepare_workspace(install):
         accepted=False
         try:accepted=json.loads(receipt.read_text(encoding='utf-8'))['manifest_sha256']==digest(install/BUNDLE_MANIFEST)
         except (OSError,ValueError,KeyError):pass
-        if not accepted or legacy[0].exists():verify_installed(install)
+        if (not accepted or legacy[0].exists()
+                or (backup in retained and not (backup/BUNDLE_MANIFEST).is_file())):
+            verify_installed(install)
         if accepted:prune_history(install)
         history=backup.parent/'history';history.mkdir(exist_ok=True)
         for path in retained:
+            if path==backup and not (path/BUNDLE_MANIFEST).is_file():
+                # Manual rollback can leave a partial backup directory. Preserve
+                # it, but only after proving the current installation is intact.
+                if (path.is_symlink() or getattr(path.lstat(),'st_file_attributes',0)&1024
+                        or history.is_symlink() or getattr(history.lstat(),'st_file_attributes',0)&1024
+                        or path.resolve().parent!=backup.parent.resolve()
+                        or history.resolve().parent!=backup.parent.resolve()):
+                    raise ValueError('Linked incomplete backup unsupported')
+                target=history/('incomplete-'+uuid.uuid4().hex)
+                os.replace(path,target)
+                report_progress('불완전한 백업 별도 보관 · 현재 설치 검증 완료 · '+str(target))
+                continue
             old=json.loads((path/BUNDLE_MANIFEST).read_text(encoding='utf-8'))
             if old.get('contract')!=BUNDLE_CONTRACT or old.get('project')!='DKB':raise ValueError('Invalid retained backup')
             os.replace(path,history/('backup-'+uuid.uuid4().hex))
@@ -478,12 +492,13 @@ class RemoteDelta(io.RawIOBase):
 
 def release_documents(release,cfg):
     assets={a['name']:a['browser_download_url'] for a in release['assets']}
-    meta=json.loads(download(assets['release.json']))
+    meta_data=download(assets['release.json']);meta=json.loads(meta_data)
     if (meta.get('contract'),meta.get('project'),meta.get('repository'),meta.get('tag'))!=(
             'biol-project-update-v1',cfg['project'],cfg['repository'],release['tag_name']):
         raise ValueError('Release identity mismatch')
     if version_key(meta['version'])!=version_key(release['tag_name']):raise ValueError('Release version mismatch')
     data=download(assets['package-manifest.json'])
+    verify_dev_documents(release,cfg,meta_data,data,meta)
     if hashlib.sha256(data).hexdigest()!=meta['package_manifest_sha256']:raise ValueError('Release manifest SHA256 mismatch')
     manifest=json.loads(data)
     if manifest['project']!=cfg['project'] or manifest['runtime_version']!=meta['runtime_version']:
@@ -491,26 +506,103 @@ def release_documents(release,cfg):
     return meta,manifest,assets
 
 
+STABLE_REPOSITORY='stupid42sr-lang/DKB_Auto_Updater'
+
+
+def dev_releases(cfg):
+    anchor=cfg.get('dev_anchor_tag','')
+    if not re.fullmatch(r'v\d+\.\d+\.\d+',anchor):raise ValueError('Invalid DEV anchor')
+    base='https://github.com/'+STABLE_REPOSITORY+'/releases/download/'+anchor+'/'
+    actual=json.loads(download('https://api.github.com/repos/'+STABLE_REPOSITORY+'/releases/tags/'+anchor))
+    if actual['tag_name']!=anchor or actual['draft'] or actual['prerelease']:
+        raise ValueError('DEV anchor is not an existing published STABLE release')
+    index=json.loads(download(base+'DEV_index.json'))
+    if (index.get('contract')!='dkb-dev-assets-v1' or index.get('repository')!=STABLE_REPOSITORY
+            or index.get('anchor_tag')!=anchor or not isinstance(index.get('builds'),list)
+            or not 1<=len(index['builds'])<=1000):
+        raise ValueError('Invalid DEV index')
+    leaves={'release.json':'release.json','package-manifest.json':'package-manifest.json',
+            'update.zip':'Update.zip','full.zip':'Auto.zip','SHA256SUMS.txt':'SHA256SUMS.txt'}
+    result=[];seen=set()
+    for item in index['builds']:
+        version=item['version']
+        if not re.fullmatch(r'\d+\.\d+\.\d+-dev\.[1-9]\d*',version) or version in seen:
+            raise ValueError('Invalid/duplicate DEV version')
+        seen.add(version);records=item['assets']
+        if not {'release.json','package-manifest.json','update.zip','SHA256SUMS.txt'}<=records.keys():
+            raise ValueError('Incomplete DEV asset index')
+        assets=[]
+        for role,entry in records.items():
+            if (role not in leaves or entry['name']!='DEV_'+version+'_'+leaves[role]
+                    or not re.fullmatch(r'[0-9a-f]{64}',entry['sha256'])):
+                raise ValueError('Non-DEV asset or invalid DEV hash')
+            url=base+urllib.parse.quote(entry['name'],safe='')
+            assets.append(dict(name=entry['name'],browser_download_url=url))
+            if role in ('release.json','package-manifest.json'):
+                assets.append(dict(name=role,browser_download_url=url))
+        result.append(dict(tag_name='v'+version,assets=assets,dev_record=item))
+    if index.get('latest')!=max(seen,key=version_key):raise ValueError('DEV latest version mismatch')
+    return result
+
+
+def verify_dev_documents(release,cfg,meta_data,manifest_data,meta):
+    if cfg.get('channel')!='DEV':return
+    item=release['dev_record'];records=item['assets']
+    if (hashlib.sha256(meta_data).hexdigest()!=records['release.json']['sha256']
+            or hashlib.sha256(manifest_data).hexdigest()!=records['package-manifest.json']['sha256']
+            or meta.get('update_channel')!='DEV' or meta.get('version')!=item['version']
+            or meta.get('dev_anchor_tag')!=cfg['dev_anchor_tag']
+            or meta.get('dev_assets')!={role:entry['name'] for role,entry in records.items()}
+            or meta['delta']['name']!=records['update.zip']['name']
+            or meta['delta']['sha256']!=records['update.zip']['sha256']):
+        raise ValueError('DEV index/manifest/release identity or SHA256 mismatch')
+    if bool(meta.get('full'))!=('full.zip' in records):raise ValueError('DEV Full identity mismatch')
+    if 'full.zip' in records and (meta['full']['name']!=records['full.zip']['name']
+                                or meta['full']['sha256']!=records['full.zip']['sha256']):
+        raise ValueError('DEV Full SHA256 identity mismatch')
+
+
+def update_source(install):
+    cfg=json.loads(Path(__file__).with_name('update-config.json').read_text(encoding='utf-8'))
+    if (cfg.get('contract')!='biol-project-update-source-v1'
+            or cfg.get('project')!='DKB' or cfg.get('repository')!=STABLE_REPOSITORY):
+        raise ValueError('Unexpected update source')
+    # Ignore legacy allow_prerelease=true: DEV is selected only through its index.
+    cfg=dict(cfg,repository=STABLE_REPOSITORY,allow_prerelease=False,channel='STABLE')
+    root=managed_root(install)
+    app=root/'DKB_Auto' if (root/BUNDLE_MANIFEST).is_file() else Path(install)
+    try:
+        choice=json.loads((app/'settings/update-channel.json').read_text(encoding='utf-8-sig'))
+        if choice.get('contract')!='dkb-update-channel-v1' or choice.get('channel')!='DEV':return cfg
+        if not re.fullmatch(r'v\d+\.\d+\.\d+',cfg.get('dev_anchor_tag','')):return cfg
+        return dict(cfg,channel='DEV')
+    except (OSError,ValueError,TypeError,AttributeError):pass
+    return cfg
+
+
 def inspect_release(install):
     """Read-only structured check; safe while the app holds its instance mutex."""
-    cfg = json.loads(Path(__file__).with_name('update-config.json').read_text(encoding='utf-8'))
-    if cfg.get('contract') != 'biol-project-update-source-v1' or cfg.get('repository') != 'stupid42sr-lang/DKB_Auto_Updater':
-        raise ValueError('Unexpected update source')
+    cfg = update_source(install)
     old = installed_manifest(install)
     if old['project'] != cfg['project']:
         raise ValueError('Install project mismatch')
-    releases = json.loads(download('https://api.github.com/repos/' + cfg['repository'] + '/releases?per_page=100'))
-    choices = [r for r in releases if not r['draft'] and (cfg.get('allow_prerelease') or not r['prerelease'])]
+    if cfg['channel']=='DEV':
+        choices=dev_releases(cfg)
+    else:
+        releases = json.loads(download('https://api.github.com/repos/' + cfg['repository'] + '/releases?per_page=100'))
+        choices = [r for r in releases if not r['draft'] and not r['prerelease']
+                   and re.fullmatch(r'v?\d+\.\d+\.\d+',r['tag_name'])]
     if not choices:
         raise ValueError('No permitted published release')
     release = max(choices,key=lambda r:version_key(r['tag_name']))
     assets = {a['name']: a['browser_download_url'] for a in release['assets']}
-    meta = json.loads(download(assets['release.json']))
+    meta_data=download(assets['release.json']);meta=json.loads(meta_data)
     if meta.get('contract') != 'biol-project-update-v1' or meta['project'] != cfg['project'] or meta['repository'] != cfg['repository'] or meta['tag'] != release['tag_name']:
         raise ValueError('Release identity mismatch')
     if version_key(meta['version'])!=version_key(release['tag_name']):
         raise ValueError('Release version mismatch')
     manifest_data = download(assets['package-manifest.json'])
+    verify_dev_documents(release,cfg,meta_data,manifest_data,meta)
     if hashlib.sha256(manifest_data).hexdigest() != meta['package_manifest_sha256']:
         raise ValueError('Release manifest SHA256 mismatch')
     new = json.loads(manifest_data)
@@ -520,6 +612,7 @@ def inspect_release(install):
     app=managed_root(install)/old['app_dir'] if bundle else Path(install)
     current=json.loads((app/'runtime/products'/(old['project']+'.json')).read_text(encoding='utf-8'))['app_version']
     result=dict(version=meta['version'],current_version=current,metadata=meta,assets=assets,
+                update_source=cfg,
                 manifest_sha256=meta['package_manifest_sha256'])
     if version_key(meta['version'])<=version_key(current):return dict(result,state='current')
     if bundle and new.get('contract')!=BUNDLE_CONTRACT:raise ValueError('Bundle update contract missing')
@@ -533,8 +626,11 @@ def inspect_release(install):
             if new.get('app_dir')!='DKB_Auto':raise ValueError('Invalid latest bundle identity')
             # Intermediate ZIPs are file sources only; install latest once.
             return dict(result,state='available',direct_delta=True,target_manifest=new,
-                release_candidates=[{'tag_name':r['tag_name'],'assets':r['assets']} for r in choices
-                    if version_key(current)<version_key(r['tag_name'])<=version_key(meta['version'])])
+                release_candidates=[dict(tag_name=r['tag_name'],assets=r['assets'],
+                    **({'dev_record':r['dev_record']} if cfg['channel']=='DEV' else {})) for r in choices
+                    if version_key(r['tag_name'])<=version_key(meta['version'])
+                    and (cfg['channel']=='DEV' or '-dev.' in current
+                         or version_key(current)<version_key(r['tag_name']))])
         return dict(result,state='baseline_mismatch')
     return dict(result,state='available')
 
@@ -572,7 +668,8 @@ def prepare_direct_delta(install,result):
     if any(user_file(n) for n in (*new['files'],*new['removed'])):
         raise ValueError('User files cannot be updated or deleted')
     folder=Path(tempfile.mkdtemp(prefix='biol-project-delta-'));archive=folder/'update.zip'
-    cfg=json.loads(Path(__file__).with_name('update-config.json').read_text(encoding='utf-8'))
+    cfg=update_source(install)
+    if cfg!=result.get('update_source'):raise ValueError('Update channel changed; check again')
     try:
         with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED) as output:
             for candidate in sorted(result['release_candidates'],key=lambda r:version_key(r['tag_name']),reverse=True):
