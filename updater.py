@@ -203,9 +203,9 @@ def user_file(name):
 
 
 @contextmanager
-def app_closed(install):
+def app_closed(install, identity_root=None):
     """Own the same named object as the existing runtime while swapping files."""
-    root = managed_root(install)
+    root = Path(identity_root) if identity_root is not None else managed_root(install)
     if not root.exists():
         root = root.with_name(root.name + '.update-backup')
     old = json.loads((root / manifest_name(root)).read_text(encoding='utf-8'))
@@ -387,6 +387,270 @@ def recover(install):
     if stage.exists(): shutil.rmtree(stage)
     lock.unlink(missing_ok=True)
     return 'Previous installation restored'
+
+
+def _recovery_write(path, value):
+    """Persist intent before a rename; an interrupted rename is reconciled by hashes."""
+    temp=path.with_suffix('.tmp')
+    with temp.open('w',encoding='utf-8') as stream:
+        json.dump(value,stream,ensure_ascii=False,sort_keys=True)
+        stream.flush();os.fsync(stream.fileno())
+    os.replace(temp,path)
+
+
+def _recovery_tree(path):
+    """Hash all bytes, including user data; reject links before traversing them."""
+    if path.is_symlink() or (path.exists() and getattr(path.lstat(),'st_file_attributes',0)&1024):
+        raise ValueError('Linked recovery path: '+str(path))
+    if not path.exists():return None
+    if path.is_file():return {'file':digest(path)}
+    result={'dir':{}}
+    for child in sorted(path.iterdir(),key=lambda p:p.name.casefold()):
+        result['dir'][child.name]=_recovery_tree(child)
+    return result
+
+
+def _recovery_name(name):
+    if (not isinstance(name,str) or not name or name in ('.','..') or
+            any(c in name for c in '/\\:') or name.casefold()=='.update' or
+            name.endswith((' ','.'))):
+        raise ValueError('Invalid recovery child name')
+    return name
+
+
+def _recovery_manifest(root):
+    value=json.loads((root/BUNDLE_MANIFEST).read_text(encoding='utf-8'))
+    if (value.get('contract')!=BUNDLE_CONTRACT or value.get('project')!='DKB' or
+            value.get('app_dir')!='DKB_Auto' or not isinstance(value.get('files'),dict)):
+        raise ValueError('Invalid recovery manifest')
+    seen=set()
+    for name,sha in value['files'].items():
+        safe(root,name)
+        if any(part in ('.','..') for part in Path(name).parts) or '\\' in name:
+            raise ValueError('Invalid manifest path')
+        _recovery_name(Path(name).parts[0])
+        if name.casefold() in seen or not isinstance(sha,str) or not re.fullmatch('[0-9a-f]{64}',sha):
+            raise ValueError('Invalid manifest SHA256/path')
+        seen.add(name.casefold())
+    return value
+
+
+def recovery_idle(install):
+    """Inspect real processes, never interpret a leftover lock file as liveness."""
+    import subprocess
+    if os.name!='nt':raise RuntimeError('Cannot establish updater process state on this platform')
+    code=("[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $ErrorActionPreference='Stop'; @(Get-CimInstance Win32_Process | "
+          "Select-Object ProcessId,ParentProcessId,Name,CommandLine) | ConvertTo-Json -Compress")
+    try:
+        result=subprocess.run(['powershell.exe','-NoProfile','-NonInteractive','-Command',code],
+            capture_output=True,encoding='utf-8-sig',errors='strict',timeout=30,
+            creationflags=0x08000000,check=True)
+        if not result.stdout:raise ValueError('No process inventory output')
+        processes=json.loads(result.stdout)
+        if not isinstance(processes,list) or not processes:raise ValueError('Empty process inventory')
+        by_pid={p['ProcessId']:p for p in processes}
+        if os.getpid() not in by_pid:raise ValueError('Incomplete process inventory')
+        ancestors=set();pid=os.getpid()
+        while pid in by_pid and pid not in ancestors:
+            ancestors.add(pid);pid=by_pid[pid]['ParentProcessId']
+        for process in processes:
+            name=process['Name'].casefold();command=process.get('CommandLine')
+            if name.startswith(('python','dkb','biol')) and not command:
+                raise RuntimeError('Cannot inspect process: '+name)
+            if process['ProcessId'] in ancestors:continue
+            text=(command or '').casefold()
+            if str(install).casefold() in text and name.startswith(('dkb','python')):
+                raise RuntimeError('DKB installation process is still running')
+            if any(token in text for token in ('updater.py','project_update.py','bundle_handoff.py','recover_previous.py')):
+                raise RuntimeError('Update/recovery process is still running')
+    except (OSError,ValueError,KeyError,subprocess.SubprocessError) as exc:
+        raise RuntimeError('Cannot establish updater process state; recovery refused') from exc
+
+
+def _recovery_preflight(root):
+    home=root/'.update';backup=home/'backup';stage=home/'stage'
+    # Scan before reading any manifest/journal, including the workspace itself.
+    for path in (root,home):
+        if path.is_symlink() or (path.exists() and getattr(path.lstat(),'st_file_attributes',0)&1024):
+            raise ValueError('Linked installation/workspace')
+    for child in root.iterdir():
+        if child.name!='.update':_recovery_tree(child)
+    for leaf in ('backup','stage','transaction.json','transaction.tmp','lock','recovery.json','recovery.tmp','accepted.json'):
+        _recovery_tree(home/leaf)
+    state_path=home/'recovery.json'
+    state=json.loads(state_path.read_text(encoding='utf-8')) if state_path.exists() else None
+    pending=any((home/name).exists() for name in ('backup','stage','transaction.json','transaction.tmp','lock'))
+    if state is not None and not isinstance(state,dict):raise ValueError('Invalid recovery progress')
+    if state and (not state.get('complete') or not pending):return state
+    journal_path=home/'transaction.json'
+    journal=None
+    if not journal_path.exists() and (home/'transaction.tmp').exists():journal_path=home/'transaction.tmp'
+    if journal_path.exists():
+        journal=json.loads(journal_path.read_text(encoding='utf-8'))
+        if not isinstance(journal,dict) or set(journal)!={'old','new'}:raise ValueError('Invalid swap journal')
+        for names in journal.values():
+            if not isinstance(names,list):raise ValueError('Invalid swap journal entries')
+            for name in names:_recovery_name(name)
+            if len({n.casefold() for n in names})!=len(names):raise ValueError('Duplicate journal entry')
+        if not backup.is_dir():raise ValueError('Journal backup missing')
+    elif not pending:
+        raise ValueError('No previous installation or interrupted update')
+    # An old child is either in backup or still in install. Intent alone is not proof of a move.
+    old_names=set(p.name for p in backup.iterdir()) if backup.exists() else set()
+    if journal:
+        old_names.update(journal['old'])
+        old_names.update(p.name for p in root.iterdir() if p.name!='.update' and p.name not in journal['new'])
+    elif not backup.exists() or not old_names:
+        old_names.update(p.name for p in root.iterdir() if p.name!='.update')
+    if len({name.casefold() for name in old_names})!=len(old_names):raise ValueError('Ambiguous original child names')
+    selected={}
+    for name in old_names:
+        _recovery_name(name)
+        source=backup/name
+        if not source.exists():
+            source=root/name
+            if journal and name in journal['new'] and not (stage/name).exists():
+                raise ValueError('Original child missing: '+name)
+        if not source.exists():raise ValueError('Original child missing: '+name)
+        selected[name]=source
+    manifest_source=selected.get(BUNDLE_MANIFEST)
+    if manifest_source is None:raise ValueError('Original manifest missing')
+    manifest=_recovery_manifest(manifest_source.parent)
+    # Verify the split old installation before creating a recovery plan or moving anything.
+    for name,sha in manifest['files'].items():
+        parts=Path(name).parts;top=selected.get(parts[0])
+        if top is None:raise ValueError('Original file missing: '+name)
+        path=top.joinpath(*parts[1:])
+        if not user_file(name) and (not path.is_file() or digest(path)!=sha):
+            raise ValueError('Original file SHA256 mismatch: '+name)
+    old_user={}
+    for name,source in selected.items():
+        for path in (source.rglob('*') if source.is_dir() else [source]):
+            relative=Path(name)/path.relative_to(source) if source.is_dir() else Path(name)
+            if path.is_file() and user_file(relative.as_posix()):old_user[relative.as_posix()]=digest(path)
+    for other in (root,stage):
+        if not other.exists():continue
+        for child in other.iterdir():
+            if child.name=='.update':continue
+            for path in (child.rglob('*') if child.is_dir() else [child]):
+                name=path.relative_to(other).as_posix()
+                if path.is_file() and user_file(name):
+                    if name not in old_user or old_user[name]!=digest(path):
+                        raise ValueError('User data copies conflict; preserved: '+name)
+    work=home/('recovery-'+uuid.uuid4().hex)
+    restore=work/'restore';restore.mkdir(parents=True)
+    for name,source in selected.items():
+        target=restore/name
+        if source.is_dir():shutil.copytree(source,target)
+        else:shutil.copy2(source,target)
+        if _recovery_tree(source)!=_recovery_tree(target):
+            raise ValueError('Recovery copy/user data verification failed: '+name)
+    if _recovery_manifest(restore)!=manifest:raise ValueError('Recovery manifest changed')
+    for name,sha in manifest['files'].items():
+        if not user_file(name) and digest(safe(restore,name))!=sha:raise ValueError('Recovery copy verification failed')
+    identity=work/'identity'
+    (identity/'DKB_Auto/runtime/products').mkdir(parents=True)
+    shutil.copy2(restore/BUNDLE_MANIFEST,identity/BUNDLE_MANIFEST)
+    shutil.copy2(restore/'DKB_Auto/runtime/products/DKB.json',identity/'DKB_Auto/runtime/products/DKB.json')
+    operations=[]
+    def move(source,target):
+        operations.append({'source':source.relative_to(root).as_posix(),
+                           'target':target.relative_to(root).as_posix(),'tree':_recovery_tree(source)})
+    for child in root.iterdir():
+        if child.name!='.update':move(child,work/'replaced'/child.name)
+    for child in restore.iterdir():move(child,root/child.name)
+    for name in ('backup','stage','transaction.json','transaction.tmp','lock','accepted.json'):
+        if (home/name).exists():move(home/name,work/'evidence'/name)
+    state={'version':1,'work':work.name,'manifest':manifest,'operations':operations,'next':0,'complete':False}
+    _recovery_write(state_path,state)
+    return state
+
+
+def _recovery_validate(root,state):
+    if (not isinstance(state,dict) or state.get('version')!=1 or
+            not re.fullmatch('recovery-[0-9a-f]{32}',str(state.get('work',''))) or
+            not isinstance(state.get('operations'),list) or type(state.get('next')) is not int or
+            not 0<=state['next']<=len(state['operations']) or type(state.get('complete')) is not bool):
+        raise ValueError('Invalid recovery progress')
+    work=root/'.update'/state['work'];_recovery_tree(work)
+    seen=set()
+    for op in state['operations']:
+        source=op.get('source');target=op.get('target')
+        if not isinstance(source,str) or not isinstance(target,str):raise ValueError('Invalid recovery operation')
+        sp=source.split('/');tp=target.split('/')
+        for part in sp+tp:
+            if part!='.update':_recovery_name(part)
+        valid=(len(sp)==1 and sp[0]!='.update' and tp==['.update',state['work'],'replaced',sp[0]] or
+               len(sp)==4 and sp[3]!='.update' and sp[:3]==['.update',state['work'],'restore'] and tp==[sp[3]] or
+               len(sp)==2 and sp[0]=='.update' and sp[1] in
+               ('backup','stage','transaction.json','transaction.tmp','lock','accepted.json') and
+               tp==['.update',state['work'],'evidence',sp[1]])
+        if not valid or target.casefold() in seen or op.get('tree') is None:
+            raise ValueError('Unsafe recovery operation')
+        seen.add(target.casefold())
+        for path in (root/source,root/target):
+            if not path.resolve().is_relative_to(root):raise ValueError('Recovery path escapes installation')
+            # Check every existing ancestor before creating destination parents.
+            for parent in (path,*path.parents):
+                if parent==root.parent:break
+                if parent.is_symlink() or (parent.exists() and getattr(parent.lstat(),'st_file_attributes',0)&1024):
+                    raise ValueError('Linked recovery operation')
+    return work
+
+
+@contextmanager
+def _recovery_guard(root):
+    for path in (root,*root.parents,root/'.update'):
+        if path.is_symlink() or (path.exists() and getattr(path.lstat(),'st_file_attributes',0)&1024):
+            raise ValueError('Linked recovery root')
+    if not (root/'.update').is_dir():raise ValueError('No update workspace')
+    k=ctypes.WinDLL('kernel32',use_last_error=True)
+    k.CreateMutexW.argtypes=[ctypes.c_void_p,wintypes.BOOL,wintypes.LPCWSTR]
+    k.CreateMutexW.restype=wintypes.HANDLE
+    k.CloseHandle.argtypes=[wintypes.HANDLE]
+    name=hashlib.sha256(str(root).casefold().encode('utf-8')).hexdigest()
+    ctypes.set_last_error(0)
+    handle=k.CreateMutexW(None,False,'Local\\DKB_Explicit_Recovery_'+name)
+    if not handle:raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        if ctypes.get_last_error()==183:raise RuntimeError('Another recovery owns the workspace')
+        yield
+    finally:k.CloseHandle(handle)
+
+
+def recover_interrupted(install):
+    root=Path(install).absolute()
+    with _recovery_guard(root):return _recover_interrupted_locked(root)
+
+
+def _recover_interrupted_locked(install):
+    """Explicit bundle recovery only. Never invoked by normal apply/prepare."""
+    root=Path(install).absolute()
+    recovery_idle(root)
+    state=_recovery_preflight(root)
+    work=_recovery_validate(root,state)
+    # Identity is taken from the verified original copy, even when install is split.
+    identity=work/'identity'
+    manifest=_recovery_manifest(identity)
+    if state['manifest']!=manifest:raise ValueError('Recovery identity/plan mismatch')
+    product_path='DKB_Auto/runtime/products/DKB.json'
+    if product_path not in manifest['files'] or digest(identity/product_path)!=manifest['files'][product_path]:
+        raise ValueError('Cannot establish verified application identity')
+    with app_closed(root,identity_root=identity):
+        while state['next']<len(state['operations']):
+            op=state['operations'][state['next']];source=root/op['source'];target=root/op['target']
+            src=_recovery_tree(source);dst=_recovery_tree(target)
+            if src==op['tree'] and dst is None:
+                target.parent.mkdir(parents=True,exist_ok=True)
+                os.replace(source,target)
+            elif src is not None or dst!=op['tree']:
+                raise ValueError('Recovery files changed/conflict; preserved: '+op['source'])
+            state['next']+=1;_recovery_write(root/'.update/recovery.json',state)
+        if _recovery_manifest(root)!=manifest:raise ValueError('Restored manifest mismatch')
+        for name,sha in manifest['files'].items():
+            if not user_file(name) and digest(safe(root,name))!=sha:raise ValueError('Restored file mismatch: '+name)
+        state['complete']=True;_recovery_write(root/'.update/recovery.json',state)
+    return 'Previous installation verified and restored; replaced files and evidence retained at '+str(work)
 
 
 def finish(install):
@@ -722,6 +986,8 @@ if __name__ == '__main__':
     if a.check and not a.github: p.error('--check requires --github')
     modes = [a.recover, a.finish, a.github, bool(a.zip and a.sha256)]
     if sum(map(bool, modes)) != 1: p.error('Choose exactly one of --github, --zip/--sha256, --recover, --finish')
+    if a.recover and (Path(a.install)/'.update').exists():
+        print(recover_interrupted(a.install));sys.exit(0)
     with app_closed(a.install):
         if a.recover: print(recover(a.install))
         elif a.finish: print(finish(a.install))
