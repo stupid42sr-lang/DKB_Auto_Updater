@@ -79,7 +79,7 @@ def verify_installed(install):
     return manifest
 
 
-def prepare_workspace(install):
+def prepare_workspace(install, preserve_damaged=False):
     """Retain completed backups internally; never discard interrupted work."""
     install=managed_root(install)
     if not (install/BUNDLE_MANIFEST).is_file():return
@@ -95,7 +95,12 @@ def prepare_workspace(install):
         except (OSError,ValueError,KeyError):pass
         if (not accepted or legacy[0].exists()
                 or (backup in retained and not (backup/BUNDLE_MANIFEST).is_file())):
-            verify_installed(install)
+            try:verify_installed(install)
+            except (OSError,ValueError):
+                # Complete backups can be archived without discarding evidence.
+                # Partial/interrupted work still requires explicit recovery.
+                if not preserve_damaged or any(not (p/BUNDLE_MANIFEST).is_file() for p in retained):raise
+                accepted=False
         if accepted:prune_history(install)
         history=backup.parent/'history';history.mkdir(exist_ok=True)
         for path in retained:
@@ -248,7 +253,7 @@ def safe(root, name):
 
 def apply(install, archive, expected_sha256):
     install, archive = managed_root(install), Path(archive).resolve()
-    prepare_workspace(install)
+    prepare_workspace(install, preserve_damaged=True)
     backup,stage,lock=workspace(install)
     report_progress('다운로드 파일 검증 중...')
     if digest(archive) != expected_sha256:
@@ -288,7 +293,15 @@ def apply(install, archive, expected_sha256):
             for n, h in old['files'].items():
                 if user_file(n): continue
                 p = safe(install, n)
-                if not p.is_file() or digest(p) != h: raise ValueError('Local managed file changed: ' + n)
+                if not p.is_file() or digest(p) != h:
+                    # Never use damaged bytes as the base of a new install.
+                    # Only verified replacement bytes (or declared removal)
+                    # make an old mismatch irrelevant to the target payload.
+                    if n in removed:continue
+                    if (n not in names or n not in new['files']
+                            or hashlib.sha256(z.read(n)).hexdigest()!=new['files'][n]):
+                        raise ValueError('Local managed file changed; verified repair required: ' + n)
+                    report_progress('손상 파일 복구 준비: '+n)
             # Reject reparse links; staging must never write outside this installation.
             report_progress('설치 경로 확인 중...')
             if any(p.is_symlink() or (getattr(p.lstat(), 'st_file_attributes', 0) & 1024)
@@ -305,7 +318,7 @@ def apply(install, archive, expected_sha256):
                 return shutil.copy2(source,target)
             shutil.copytree(install, stage,copy_function=stage_file,
                 ignore=lambda home,names: ['.update'] if Path(home)==install else [])
-            for n in removed: safe(stage, n).unlink()
+            for n in removed: safe(stage, n).unlink(missing_ok=True)
             report_progress('변경 파일 적용 중...')
             for n in names:
                 if n == 'license.dat': continue
@@ -717,7 +730,7 @@ def version_key(value):
 
 
 class RemoteDelta(io.RawIOBase):
-    """Read ZIP directory and selected compressed entries, never a Full asset."""
+    """Read ZIP directory and selected entries; never download an entire Full."""
     def __init__(self,url):
         super().__init__()
         if urllib.parse.urlparse(url).scheme!='https':raise ValueError('HTTPS required')
@@ -876,9 +889,12 @@ def inspect_release(install):
     app=managed_root(install)/old['app_dir'] if bundle else Path(install)
     current=json.loads((app/'runtime/products'/(old['project']+'.json')).read_text(encoding='utf-8'))['app_version']
     result=dict(version=meta['version'],current_version=current,metadata=meta,assets=assets,
-                update_source=cfg,
-                manifest_sha256=meta['package_manifest_sha256'])
+                update_source=cfg, release_source=release,
+                manifest_sha256=meta['package_manifest_sha256'], target_manifest=new)
     if version_key(meta['version'])<=version_key(current):return dict(result,state='current')
+    result['repair_candidates']=[dict(tag_name=r['tag_name'],assets=r['assets'],
+        **({'dev_record':r['dev_record']} if cfg['channel']=='DEV' else {}))
+        for r in choices if version_key(r['tag_name'])<=version_key(meta['version'])]
     if bundle and new.get('contract')!=BUNDLE_CONTRACT:raise ValueError('Bundle update contract missing')
     if not bundle and new.get('contract')==BUNDLE_CONTRACT:return dict(result,state='full_install_required')
     if not bundle and old['runtime_version'] != meta['runtime_version']:return dict(result,state='runtime_required')
@@ -889,7 +905,7 @@ def inspect_release(install):
         if bundle:
             if new.get('app_dir')!='DKB_Auto':raise ValueError('Invalid latest bundle identity')
             # Intermediate ZIPs are file sources only; install latest once.
-            return dict(result,state='available',direct_delta=True,target_manifest=new,
+            return dict(result,state='available',direct_delta=True,
                 release_candidates=[dict(tag_name=r['tag_name'],assets=r['assets'],
                     **({'dev_record':r['dev_record']} if cfg['channel']=='DEV' else {})) for r in choices
                     if version_key(r['tag_name'])<=version_key(meta['version'])
@@ -903,11 +919,29 @@ def prepare_update(install):
     result=inspect_release(install)
     if result['state']!='available':raise ValueError('Project delta is not applicable: '+result['state'])
     root=managed_root(install)
-    prepare_workspace(root)
+    prepare_workspace(root, preserve_damaged=True)
     if any(path.exists() for path in workspace(root)):
         raise RuntimeError('Previous update pending; inspect before applying')
     meta=result['metadata']
-    if result.get('direct_delta'):
+    old=installed_manifest(root)
+    damaged=[]
+    report_progress('설치 파일 복구 필요 여부 확인 중...')
+    for name,value in old['files'].items():
+        if user_file(name):continue
+        path=safe(root,name)
+        if not path.is_file() or digest(path)!=value:damaged.append(name)
+    if damaged and old.get('contract')!=BUNDLE_CONTRACT:
+        raise ValueError('Damaged legacy installation requires verified bundle migration')
+    if damaged:
+        report_progress('설치 파일 복구 준비 · '+str(len(damaged))+'개')
+    if result.get('direct_delta') or damaged:
+        result=dict(result, repair_files=damaged)
+        # Latest verified release is also a file source when the baseline matches.
+        if damaged and result.get('repair_candidates'):
+            result['release_candidates']=result['repair_candidates']
+        result.setdefault('release_candidates', [])
+        if not result['release_candidates']:
+            result['release_candidates']=[result['release_source']]
         return prepare_direct_delta(install,result)
     data=download(result['assets'][meta['delta']['name']])
     if hashlib.sha256(data).hexdigest()!=meta['delta']['sha256']:raise ValueError('ZIP SHA256 mismatch')
@@ -926,7 +960,8 @@ def prepare_update(install):
 
 def prepare_direct_delta(install,result):
     old=installed_manifest(install);new=dict(result['target_manifest'])
-    needed={n:h for n,h in new['files'].items() if old['files'].get(n)!=h}
+    needed={n:h for n,h in new['files'].items()
+            if old['files'].get(n)!=h or n in result.get('repair_files',())}
     new['removed']=sorted(set(old['files'])-set(new['files']))
     new['update_base_files_sha256']=files_baseline(old['files'])
     if any(user_file(n) for n in (*new['files'],*new['removed'])):
@@ -954,9 +989,25 @@ def prepare_direct_delta(install,result):
                         data=source.read(name)
                         if hashlib.sha256(data).hexdigest()!=needed[name]:raise ValueError('Delta file SHA256 mismatch: '+name)
                         output.writestr(name,data);del needed[name]
-            if needed:raise ValueError('Required latest files unavailable in published deltas: '+', '.join(sorted(needed)))
+                remaining=matching.intersection(needed)
+                if remaining and cm.get('full'):
+                    # A dependency may exist only in an older Full. Use it only
+                    # when its authenticated source manifest has the exact
+                    # latest target hash; never downgrade a dependency.
+                    with RemoteDelta(assets[cm['full']['name']]) as remote,zipfile.ZipFile(remote) as source:
+                        names=source.namelist()
+                        if len({n.casefold() for n in names})!=len(names):raise ValueError('Duplicate ZIP paths')
+                        if hashlib.sha256(source.read(BUNDLE_MANIFEST)).hexdigest()!=cm['package_manifest_sha256']:
+                            raise ValueError('Repair manifest SHA256 mismatch')
+                        for name in sorted(remaining.intersection(names)):
+                            safe(folder,name)
+                            report_progress('복구 파일 다운로드: '+name)
+                            data=source.read(name)
+                            if hashlib.sha256(data).hexdigest()!=needed[name]:raise ValueError('Repair file SHA256 mismatch: '+name)
+                            output.writestr(name,data);del needed[name]
+            if needed:raise ValueError('Verified repair files unavailable; installation unchanged: '+', '.join(sorted(needed)))
             output.writestr(BUNDLE_MANIFEST,json.dumps(new,ensure_ascii=False,indent=2).encode('utf-8'))
-        prepared={k:v for k,v in result.items() if k not in ('target_manifest','release_candidates')}
+        prepared={k:v for k,v in result.items() if k not in ('target_manifest','release_candidates','repair_candidates','release_source')}
         return dict(prepared,archive=str(archive),download_dir=str(folder),sha256=digest(archive))
     except BaseException:
         shutil.rmtree(folder);raise
