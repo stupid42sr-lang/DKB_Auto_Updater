@@ -2,7 +2,7 @@
   "runtime_version": "1.1.0",
   "project": "DKB",
   "files": {
-    "updater.py": "68a9a1c915e45390902e114dc978d9a099d13b168ba8d0d047fe08eca017169f",
+    "updater.py": "c9be9b9bb4a7c2f81d6dfdab7eb5d7bb196920045652ec4b79723fd4863e0e8d",
     "update.cmd": "e97d9d09a127c3e7216203b83ceb8284d022b6f3dafcb7e9b89004afd0eb2342",
     "update-config.json": "bfd82d1c52bc419862d510529cb03c1c555b37bf6bcbb415af6ed9a674284103",
     "dev-devices.json": "f705a644e6fdf1ecfbb3f74c0d5ed9918a8c95d23becd9b7aa75f388bcf8f108"

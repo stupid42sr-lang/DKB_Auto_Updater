@@ -16,6 +16,7 @@ import io
 import sys
 import uuid
 import ssl
+import time
 from contextlib import contextmanager
 
 BUNDLE_CONTRACT='biol-dkb-distribution-v1'
@@ -79,6 +80,21 @@ def verify_installed(install):
     return manifest
 
 
+def _archive_backup(source,target):
+    """Retry transient Windows directory locks without discarding old bytes."""
+    for attempt in range(5):
+        try:
+            os.replace(source,target)
+            return
+        except PermissionError as error:
+            if getattr(error,'winerror',None) not in (5,32,33):raise
+            if attempt==4:
+                report_progress('이전 업데이트 백업 보관 실패 · 현재 설치·백업 유지 · 파일 사용 프로그램과 동기화 상태 확인 필요')
+                raise
+            report_progress('이전 업데이트 백업 사용 중 · 보관 재시도 %d/4'%(attempt+1))
+            time.sleep(.5)
+
+
 def prepare_workspace(install, preserve_damaged=False):
     """Retain completed backups internally; never discard interrupted work."""
     install=managed_root(install)
@@ -113,12 +129,12 @@ def prepare_workspace(install, preserve_damaged=False):
                         or history.resolve().parent!=backup.parent.resolve()):
                     raise ValueError('Linked incomplete backup unsupported')
                 target=history/('incomplete-'+uuid.uuid4().hex)
-                os.replace(path,target)
+                _archive_backup(path,target)
                 report_progress('불완전한 백업 별도 보관 · 현재 설치 검증 완료 · '+str(target))
                 continue
             old=json.loads((path/BUNDLE_MANIFEST).read_text(encoding='utf-8'))
             if old.get('contract')!=BUNDLE_CONTRACT or old.get('project')!='DKB':raise ValueError('Invalid retained backup')
-            os.replace(path,history/('backup-'+uuid.uuid4().hex))
+            _archive_backup(path,history/('backup-'+uuid.uuid4().hex))
         receipt.unlink(missing_ok=True)
     legacy_log=install.with_name('DKB-update.log')
     if legacy_log.is_file():
