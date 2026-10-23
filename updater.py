@@ -21,6 +21,8 @@ from contextlib import contextmanager
 
 BUNDLE_CONTRACT='biol-dkb-distribution-v1'
 BUNDLE_MANIFEST='distribution-manifest.json'
+BACKUP_OPTIONAL_PROTOCOL=1
+UNBACKED_MARKER='unbacked-update.json'
 _progress_callback = None
 
 
@@ -118,7 +120,12 @@ def prepare_workspace(install, preserve_damaged=False):
                 if not preserve_damaged or any(not (p/BUNDLE_MANIFEST).is_file() for p in retained):raise
                 accepted=False
         if accepted:prune_history(install)
-        history=backup.parent/'history';history.mkdir(exist_ok=True)
+        history=backup.parent/'history'
+        try:history.mkdir(exist_ok=True)
+        except PermissionError as error:
+            if getattr(error,'winerror',None) not in (5,32,33):raise
+            report_progress('이전 백업 보관 폴더 접근 불가 · 기존 백업 유지 · 로컬 복구 백업 없이 업데이트 계속')
+            return False
         for path in retained:
             if path==backup and not (path/BUNDLE_MANIFEST).is_file():
                 # Manual rollback can leave a partial backup directory. Preserve
@@ -129,12 +136,20 @@ def prepare_workspace(install, preserve_damaged=False):
                         or history.resolve().parent!=backup.parent.resolve()):
                     raise ValueError('Linked incomplete backup unsupported')
                 target=history/('incomplete-'+uuid.uuid4().hex)
-                _archive_backup(path,target)
+                try:_archive_backup(path,target)
+                except PermissionError as error:
+                    if getattr(error,'winerror',None) not in (5,32,33):raise
+                    report_progress('이전 백업 보관 생략 · 기존 백업 유지 · 로컬 복구 백업 없이 업데이트 계속')
+                    return False
                 report_progress('불완전한 백업 별도 보관 · 현재 설치 검증 완료 · '+str(target))
                 continue
             old=json.loads((path/BUNDLE_MANIFEST).read_text(encoding='utf-8'))
             if old.get('contract')!=BUNDLE_CONTRACT or old.get('project')!='DKB':raise ValueError('Invalid retained backup')
-            _archive_backup(path,history/('backup-'+uuid.uuid4().hex))
+            try:_archive_backup(path,history/('backup-'+uuid.uuid4().hex))
+            except PermissionError as error:
+                if getattr(error,'winerror',None) not in (5,32,33):raise
+                report_progress('이전 백업 보관 생략 · 기존 백업 유지 · 로컬 복구 백업 없이 업데이트 계속')
+                return False
         receipt.unlink(missing_ok=True)
     legacy_log=install.with_name('DKB-update.log')
     if legacy_log.is_file():
@@ -267,14 +282,46 @@ def safe(root, name):
     return target
 
 
+def _apply_without_backup(install,stage,new,removed):
+    """User-authorized managed-file replacement; never reuse a stale backup."""
+    updater=stage/'DKB_Auto_Updater/updater.py'
+    if updater.is_file() and b'BACKUP_OPTIONAL_PROTOCOL=1' not in updater.read_bytes():
+        raise ValueError('Target updater does not support backup-free recovery markers; compatible full install required')
+    # Staging and package verification remain mandatory before the first write.
+    for name,sha in new['files'].items():
+        path=safe(stage,name)
+        if not path.is_file() or digest(path)!=sha:raise ValueError('Staged file SHA256 mismatch: '+name)
+    marker=install/'.update'/UNBACKED_MARKER
+    for path in (marker,marker.with_suffix('.tmp')):
+        if path.is_symlink() or (path.exists() and getattr(path.lstat(),'st_file_attributes',0)&1024):
+            raise ValueError('Linked backup-free update marker unsupported')
+    state={'state':'applying','manifest_sha256':digest(stage/BUNDLE_MANIFEST)}
+    _recovery_write(marker,state)
+    report_progress('로컬 복구 백업 없이 업데이트 적용 · 기존 백업·사용자 설정 보존')
+    for name,sha in sorted(new['files'].items()):
+        source,target=safe(stage,name),safe(install,name)
+        if target.is_file() and digest(target)==sha:continue
+        target.parent.mkdir(parents=True,exist_ok=True)
+        os.replace(source,target)
+    for name in removed:safe(install,name).unlink(missing_ok=True)
+    for name,sha in new['files'].items():
+        if digest(safe(install,name))!=sha:raise ValueError('Installed file SHA256 mismatch: '+name)
+    # Publish the new manifest only after every managed file is confirmed.
+    os.replace(stage/BUNDLE_MANIFEST,install/BUNDLE_MANIFEST)
+    verify_installed(install)
+    state['state']='complete';_recovery_write(marker,state)
+    shutil.rmtree(stage)
+    return 'Applied and verified without a local rollback backup; previous retained backup unchanged'
+
+
 def apply(install, archive, expected_sha256):
     install, archive = managed_root(install), Path(archive).resolve()
-    prepare_workspace(install, preserve_damaged=True)
+    backup_optional=prepare_workspace(install, preserve_damaged=True) is False
     backup,stage,lock=workspace(install)
     report_progress('다운로드 파일 검증 중...')
     if digest(archive) != expected_sha256:
         raise ValueError('ZIP SHA256 mismatch; installation unchanged')
-    if backup.exists() or stage.exists():
+    if (backup.exists() and not backup_optional) or stage.exists():
         raise RuntimeError('Previous update pending; recover before retry')
     with lock.open('x'):
         pass
@@ -352,7 +399,22 @@ def apply(install, archive, expected_sha256):
                 if not p.is_file() or digest(p) != h: raise ValueError('File SHA256 mismatch: ' + n)
         report_progress('설치본 교체 중...')
         if bundle:
-            swap_payload(install,stage,backup);swapped=True
+            marker_path=install/'.update'/UNBACKED_MARKER
+            if backup_optional:
+                result=_apply_without_backup(install,stage,new,removed);swapped=True
+                return result
+            # A new normal backup supersedes the old backup-free completion marker.
+            if marker_path.exists():
+                if json.loads(marker_path.read_text(encoding='utf-8')).get('state')!='complete':
+                    raise RuntimeError('Interrupted backup-free update; verified full installation required')
+                marker_path.unlink()
+            try:swap_payload(install,stage,backup)
+            except PermissionError as error:
+                if (getattr(error,'winerror',None) not in (5,32,33)
+                        or backup.exists() or (backup.parent/'transaction.json').exists()):raise
+                result=_apply_without_backup(install,stage,new,removed);swapped=True
+                return result
+            swapped=True
         else:
             os.replace(install, backup)
             try:
@@ -367,10 +429,12 @@ def apply(install, archive, expected_sha256):
     finally:
         failing=sys.exc_info()[0] is not None
         try:
-            if not swapped and stage.exists() and not (backup.parent/'transaction.json').exists():
+            unbacked=backup.parent/UNBACKED_MARKER
+            interrupted_unbacked=(unbacked.exists() and json.loads(unbacked.read_text(encoding='utf-8')).get('state')=='applying')
+            if not swapped and stage.exists() and not (backup.parent/'transaction.json').exists() and not interrupted_unbacked:
                 report_progress('실패한 임시 설치본 정리 중...')
                 shutil.rmtree(stage)
-            if not (backup.parent/'transaction.json').exists():lock.unlink(missing_ok=True)
+            if not (backup.parent/'transaction.json').exists() and not interrupted_unbacked:lock.unlink(missing_ok=True)
         except OSError as exc:
             report_progress('임시 설치본 정리 실패: '+str(exc))
             if not failing:raise
@@ -378,6 +442,8 @@ def apply(install, archive, expected_sha256):
 
 def recover(install):
     install = managed_root(install)
+    if (install/'.update'/UNBACKED_MARKER).exists():
+        raise RuntimeError('No current rollback backup; preserved older backup must not be restored automatically. Use a verified full installation.')
     backup,stage,lock=workspace(install)
     # Explicit recovery is only for a stopped updater/app, including interrupted swaps.
     if not backup.is_dir(): raise ValueError('No backup; original installation must be checked manually')
@@ -498,6 +564,8 @@ def recovery_idle(install):
 
 def _recovery_preflight(root):
     home=root/'.update';backup=home/'backup';stage=home/'stage'
+    if (home/UNBACKED_MARKER).exists():
+        raise RuntimeError('No current rollback backup; use a verified full installation, older backup preserved')
     # Scan before reading any manifest/journal, including the workspace itself.
     for path in (root,home):
         if path.is_symlink() or (path.exists() and getattr(path.lstat(),'st_file_attributes',0)&1024):
@@ -689,6 +757,8 @@ def finish(install):
     if lock.exists() or stage.exists() or (backup.parent/'transaction.json').exists():
         raise RuntimeError('Updater is running or interrupted; inspect before finishing')
     verify_installed(install)
+    if (backup.parent/UNBACKED_MARKER).exists():
+        return 'Update accepted without local rollback; older backup preserved'
     if backup.exists(): shutil.rmtree(backup)
     return 'Update accepted; backup removed'
 
@@ -935,8 +1005,9 @@ def prepare_update(install):
     result=inspect_release(install)
     if result['state']!='available':raise ValueError('Project delta is not applicable: '+result['state'])
     root=managed_root(install)
-    prepare_workspace(root, preserve_damaged=True)
-    if any(path.exists() for path in workspace(root)):
+    backup_optional=prepare_workspace(root, preserve_damaged=True) is False
+    backup,stage,lock=workspace(root)
+    if stage.exists() or lock.exists() or (backup.exists() and not backup_optional):
         raise RuntimeError('Previous update pending; inspect before applying')
     meta=result['metadata']
     old=installed_manifest(root)
