@@ -11,6 +11,8 @@ from ctypes import wintypes
 import tempfile
 import urllib.request
 import urllib.parse
+import urllib.error
+import http.client
 import re
 import io
 import sys
@@ -786,25 +788,51 @@ def set_cancel_event(event):
     global _cancel_event
     _cancel_event = event
 
+def download_checkpoint():
+    if _cancel_event is not None and _cancel_event.is_set():
+        raise InterruptedError('Update download cancelled')
+
+
+def retry_download(operation):
+    """Bound retries for transient transport failures; never weaken validation."""
+    for attempt in range(3):
+        download_checkpoint()
+        try:return operation()
+        except (TimeoutError,ConnectionError,http.client.IncompleteRead,urllib.error.URLError) as exc:
+            download_checkpoint()
+            transient=(isinstance(exc,(TimeoutError,ConnectionError,http.client.IncompleteRead))
+                or (isinstance(exc,urllib.error.HTTPError) and exc.code in (408,429,500,502,503,504))
+                or isinstance(getattr(exc,'reason',None),(TimeoutError,ConnectionError)))
+            if not transient or attempt==2:raise
+            delay=attempt+1
+            if isinstance(exc,urllib.error.HTTPError):
+                retry_after=(exc.headers or {}).get('Retry-After','')
+                if str(retry_after).isdigit():delay=max(delay,min(10,int(retry_after)))
+                if exc.fp is not None:exc.close()
+            report_progress('업데이트 서버 응답 지연·연결 끊김 · 자동 재시도 '+str(attempt+2)+'/3')
+            if _cancel_event is not None:
+                if _cancel_event.wait(delay):download_checkpoint()
+            else:time.sleep(delay)
+
+
 def download(url):
-    def checkpoint():
-        if _cancel_event is not None and _cancel_event.is_set():
-            raise InterruptedError('Update download cancelled')
-    checkpoint()
+    download_checkpoint()
     if urllib.parse.urlparse(url).scheme != 'https':
         raise ValueError('HTTPS download required')
     req = urllib.request.Request(url, headers={'User-Agent': 'BIOL-DKB-Updater/1.0', 'Accept': 'application/vnd.github+json'})
-    with urllib.request.urlopen(req, timeout=3 if _cancel_event is not None else 60,context=update_ssl_context()) as response:
-        if urllib.parse.urlparse(response.url).scheme != 'https':
-            raise ValueError('Insecure redirect rejected')
-        chunks=[]
-        while True:
-            checkpoint()
-            chunk=response.read(65536)
-            if not chunk:break
-            chunks.append(chunk)
-        checkpoint()
-        return b''.join(chunks)
+    def request():
+        with urllib.request.urlopen(req, timeout=15 if _cancel_event is not None else 60,context=update_ssl_context()) as response:
+            if urllib.parse.urlparse(response.url).scheme != 'https':
+                raise ValueError('Insecure redirect rejected')
+            chunks=[]
+            while True:
+                download_checkpoint()
+                chunk=response.read(65536)
+                if not chunk:break
+                chunks.append(chunk)
+            download_checkpoint()
+            return b''.join(chunks)
+    return retry_download(request)
 
 
 def version_key(value):
@@ -824,20 +852,24 @@ class RemoteDelta(io.RawIOBase):
         self._range(0,0)
 
     def _range(self,start,end):
-        if _cancel_event is not None and _cancel_event.is_set():raise InterruptedError('Update cancelled')
+        download_checkpoint()
         req=urllib.request.Request(self.url,headers={'User-Agent':'BIOL-DKB-Updater/1.0',
             'Range':f'bytes={start}-{end}','Accept-Encoding':'identity'})
-        with urllib.request.urlopen(req,timeout=3 if _cancel_event is not None else 60,context=update_ssl_context()) as response:
-            if urllib.parse.urlparse(response.url).scheme!='https':raise ValueError('Insecure redirect')
-            match=re.fullmatch(r'bytes (\d+)-(\d+)/(\d+)',response.headers.get('Content-Range',''))
-            if response.status!=206 or not match or (int(match[1]),int(match[2]))!=(start,end):
-                raise RuntimeError('Delta server does not support selective download; Full download refused')
-            length=int(match[3])
-            if self.length is not None and self.length!=length:raise ValueError('Remote delta changed')
-            self.length=length
-            data=response.read(end-start+2)
-            if len(data)!=end-start+1:raise ValueError('Incomplete delta range')
-            return data
+        def request():
+            with urllib.request.urlopen(req,timeout=15 if _cancel_event is not None else 60,context=update_ssl_context()) as response:
+                if urllib.parse.urlparse(response.url).scheme!='https':raise ValueError('Insecure redirect')
+                match=re.fullmatch(r'bytes (\d+)-(\d+)/(\d+)',response.headers.get('Content-Range',''))
+                if response.status!=206 or not match or (int(match[1]),int(match[2]))!=(start,end):
+                    raise RuntimeError('Delta server does not support selective download; Full download refused')
+                length=int(match[3])
+                if self.length is not None and self.length!=length:raise ValueError('Remote delta changed')
+                data=response.read(end-start+2)
+                download_checkpoint()
+                if len(data)<end-start+1:raise http.client.IncompleteRead(data,end-start+1-len(data))
+                if len(data)>end-start+1:raise ValueError('Invalid delta range length')
+                self.length=length
+                return data
+        return retry_download(request)
 
     def seekable(self):return True
     def readable(self):return True
