@@ -19,11 +19,19 @@ import sys
 import uuid
 import ssl
 import time
+import random
+import logging
+import math
+import threading
+import types
+from collections import OrderedDict
+from email.utils import parsedate_to_datetime
 from contextlib import contextmanager
 
 BUNDLE_CONTRACT='biol-dkb-distribution-v1'
 BUNDLE_MANIFEST='distribution-manifest.json'
 BACKUP_OPTIONAL_PROTOCOL=1
+LIVE_PREPARATION_PROTOCOL=1
 UNBACKED_MARKER='unbacked-update.json'
 _progress_callback = None
 
@@ -64,14 +72,14 @@ def installed_manifest(install):
     return json.loads((root/manifest_name(root)).read_text(encoding='utf-8'))
 
 
-def workspace(install):
+def workspace(install,*,create=True):
     install=managed_root(install)
     bundle=(install/BUNDLE_MANIFEST).is_file() or (install/'.update/backup'/BUNDLE_MANIFEST).is_file()
     if bundle:
         home=install/'.update'
         if home.is_symlink() or (home.exists() and getattr(home.lstat(),'st_file_attributes',0)&1024):
             raise ValueError('Linked update workspace unsupported')
-        home.mkdir(exist_ok=True)
+        if create:home.mkdir(exist_ok=True)
         return home/'backup',home/'stage',home/'lock'
     return tuple(install.with_name(install.name+suffix) for suffix in ('.update-backup','.update-stage','.update-lock'))
 
@@ -105,7 +113,7 @@ def prepare_workspace(install, preserve_damaged=False):
     if not (install/BUNDLE_MANIFEST).is_file():return
     backup,stage,lock=workspace(install)
     legacy=tuple(install.with_name(install.name+s) for s in ('.update-backup','.update-stage','.update-lock'))
-    if stage.exists() or lock.exists() or (backup.parent/'transaction.json').exists() or any(p.exists() for p in legacy[1:]):
+    if stage.exists() or lock.exists() or any((backup.parent/n).exists() for n in ('transaction.json','transaction.tmp')) or any(p.exists() for p in legacy[1:]):
         raise RuntimeError('Previous update interrupted; inspect before applying')
     retained=[p for p in (backup,legacy[0]) if p.exists()]
     if retained:
@@ -788,40 +796,172 @@ def set_cancel_event(event):
     global _cancel_event
     _cancel_event = event
 
+# Shared only within one DKB updater process, including fresh backend imports.
+# No credentials, user settings, persistent timer or installed files are stored.
+_candidate=types.ModuleType('_biol_dkb_update_transport_v1')
+_candidate.lock=threading.RLock();_candidate.cache=OrderedDict();_candidate.inflight={};_candidate.cooldown={};_candidate.jobs=set()
+_shared=sys.modules.setdefault('_biol_dkb_update_transport_v1',_candidate)
+_request_local=threading.local()
+
+
+class UpdateDeferred(RuntimeError):
+    def __init__(self,stage,reason,wait=0):
+        self.stage=stage;self.reason=reason;self.wait_seconds=max(0,float(wait))
+        self.update_diagnostic=dict(protocol=1,stage=stage,reason=reason,
+            temporary=reason in ('busy','deadline','server_cooldown'),retry_after_seconds=math.ceil(self.wait_seconds))
+        super().__init__('Update '+stage+': '+reason+(' (retry after %.1fs)'%self.wait_seconds if wait else ''))
+
+
+@contextmanager
+def request_budget(seconds,stage):
+    previous=getattr(_request_local,'deadline',None);prior_stage=getattr(_request_local,'stage',None)
+    end=time.monotonic()+seconds
+    _request_local.deadline=min(previous,end) if previous is not None else end
+    _request_local.stage=stage
+    try:yield
+    finally:
+        _request_local.deadline=previous;_request_local.stage=prior_stage
+
+
+def network_timeout():
+    base=15 if _cancel_event is not None else 60
+    end=getattr(_request_local,'deadline',None)
+    if end is None:return base
+    remaining=end-time.monotonic()
+    if remaining<=0:raise UpdateDeferred(getattr(_request_local,'stage',None) or 'network','deadline')
+    return max(.05,min(base,remaining))
+
+
+@contextmanager
+def update_request(install,stage,seconds):
+    root=managed_root(install).resolve();key=str(root).casefold()
+    prior_root=getattr(_request_local,'root',None)
+    nested=prior_root==key
+    if nested:
+        with request_budget(seconds,stage):yield
+        return
+    with _shared.lock:
+        if key in _shared.jobs:raise UpdateDeferred(stage,'busy')
+        _shared.jobs.add(key)
+    handle=None
+    try:
+        if os.name=='nt':
+            k=ctypes.WinDLL('kernel32',use_last_error=True)
+            k.CreateMutexW.argtypes=[ctypes.c_void_p,wintypes.BOOL,wintypes.LPCWSTR];k.CreateMutexW.restype=wintypes.HANDLE
+            k.CloseHandle.argtypes=[wintypes.HANDLE]
+            ctypes.set_last_error(0)
+            handle=k.CreateMutexW(None,False,'Local\\DKB_Update_Request_'+hashlib.sha256(key.encode()).hexdigest())
+            if not handle:raise ctypes.WinError(ctypes.get_last_error())
+            if ctypes.get_last_error()==183:raise UpdateDeferred(stage,'busy')
+        _request_local.root=key
+        with request_budget(seconds,stage):yield
+    except Exception as exc:
+        reason=(exc.reason if isinstance(exc,UpdateDeferred) else
+                'http_'+str(exc.code) if isinstance(exc,urllib.error.HTTPError) else
+                'cancelled' if isinstance(exc,InterruptedError) else
+                'timeout' if isinstance(exc,TimeoutError) or isinstance(getattr(exc,'reason',None),TimeoutError) else
+                'tls' if isinstance(getattr(exc,'reason',exc),ssl.SSLError) else
+                'connection' if isinstance(exc,urllib.error.URLError) else
+                'validation' if isinstance(exc,ValueError) else type(exc).__name__)
+        phase=getattr(_request_local,'network_stage',None) or stage
+        wait=vars(exc).get('wait_seconds',0)
+        if isinstance(exc,urllib.error.HTTPError):
+            with _shared.lock:wait=max(wait,_shared.cooldown.get(urllib.parse.urlsplit(exc.filename).netloc,0)-time.monotonic())
+        exc.update_diagnostic=dict(protocol=1,stage=phase,reason=reason,
+            temporary=reason in ('busy','deadline','server_cooldown','timeout','connection') or reason in ('http_408','http_429','http_500','http_502','http_503','http_504') or reason=='http_403' and wait>0,
+            retry_after_seconds=max(0,math.ceil(wait)))
+        logging.getLogger('project_gui.DKB').warning('업데이트 분석 · 작업=%s 단계=%s 원인=%s',stage,phase,reason,extra={'gui_suppress':True})
+        raise
+    finally:
+        _request_local.root=prior_root;_request_local.network_stage=None
+        if handle is not None:k.CloseHandle(handle)
+        with _shared.lock:_shared.jobs.discard(key)
+
+
 def download_checkpoint():
     if _cancel_event is not None and _cancel_event.is_set():
         raise InterruptedError('Update download cancelled')
+    end=getattr(_request_local,'deadline',None)
+    if end is not None and time.monotonic()>=end:raise UpdateDeferred(getattr(_request_local,'stage',None) or 'network','deadline')
 
 
-def retry_download(operation):
+def transport_checkpoint(url):
+    download_checkpoint()
+    with _shared.lock:wait=_shared.cooldown.get(urllib.parse.urlsplit(url).netloc,0)-time.monotonic()
+    if wait>0:raise UpdateDeferred(getattr(_request_local,'stage',None) or 'network','server_cooldown',wait)
+
+
+def retry_download(operation,*,index_swap=False,source_url=None):
     """Bound retries for transient transport failures; never weaken validation."""
     for attempt in range(3):
         download_checkpoint()
         try:return operation()
         except (TimeoutError,ConnectionError,http.client.IncompleteRead,urllib.error.URLError) as exc:
             download_checkpoint()
+            headers=(getattr(exc,'headers',None) or {})
+            limited=isinstance(exc,urllib.error.HTTPError) and exc.code==403 and (
+                headers.get('Retry-After') is not None or headers.get('X-RateLimit-Remaining')=='0')
             transient=(isinstance(exc,(TimeoutError,ConnectionError,http.client.IncompleteRead))
-                or (isinstance(exc,urllib.error.HTTPError) and exc.code in (408,429,500,502,503,504))
-                or isinstance(getattr(exc,'reason',None),(TimeoutError,ConnectionError)))
-            if not transient or attempt==2:raise
-            delay=attempt+1
+                or (isinstance(exc,urllib.error.HTTPError) and (exc.code in (408,429,500,502,503,504) or index_swap and exc.code==404))
+                or limited or isinstance(getattr(exc,'reason',None),(TimeoutError,ConnectionError)))
+            if not transient:raise
+            delay=2**attempt
             if isinstance(exc,urllib.error.HTTPError):
-                retry_after=(exc.headers or {}).get('Retry-After','')
-                if str(retry_after).isdigit():delay=max(delay,min(10,int(retry_after)))
+                retry_after=headers.get('Retry-After')
+                try:
+                    if retry_after is not None:
+                        try:server_wait=float(retry_after)
+                        except ValueError:server_wait=parsedate_to_datetime(retry_after).timestamp()-time.time()
+                        delay=max(delay,server_wait)
+                    elif headers.get('X-RateLimit-Remaining')=='0':
+                        delay=max(delay,float(headers['X-RateLimit-Reset'])-time.time())
+                    elif exc.code==429:delay=max(delay,60)
+                except (ValueError,TypeError,KeyError,OverflowError):raise exc
+                # A long cooldown cannot fit the command lease. Never shorten
+                # it or spin requests before the server allows another attempt.
+                if (limited or exc.code in (429,503)) and getattr(_request_local,'root',None) is not None:
+                    origins={urllib.parse.urlsplit(exc.filename).netloc}
+                    if source_url:origins.add(urllib.parse.urlsplit(source_url).netloc)
+                    with _shared.lock:
+                        for origin in origins:
+                            _shared.cooldown[origin]=max(_shared.cooldown.get(origin,0),time.monotonic()+delay)
+                if delay>60:raise
                 if exc.fp is not None:exc.close()
+            if attempt==2:raise
+            delay+=random.uniform(0,min(2,delay))
+            end=getattr(_request_local,'deadline',None)
+            if end is not None and delay>=end-time.monotonic():
+                raise UpdateDeferred(getattr(_request_local,'stage',None) or 'network','server_cooldown',delay) from exc
             report_progress('업데이트 서버 응답 지연·연결 끊김 · 자동 재시도 '+str(attempt+2)+'/3')
             if _cancel_event is not None:
                 if _cancel_event.wait(delay):download_checkpoint()
             else:time.sleep(delay)
 
 
-def download(url):
+def _download_uncached(url):
     download_checkpoint()
     if urllib.parse.urlparse(url).scheme != 'https':
         raise ValueError('HTTPS download required')
-    req = urllib.request.Request(url, headers={'User-Agent': 'BIOL-DKB-Updater/1.0', 'Accept': 'application/vnd.github+json'})
+    parsed=urllib.parse.urlsplit(url)
+    _request_local.network_stage=('index' if parsed.path.endswith('/DEV_index.json') else
+        'archive' if parsed.path.endswith('.zip') else
+        'history' if parsed.hostname=='api.github.com' else 'metadata')
+    mutable_index=(parsed.hostname=='github.com' and re.fullmatch(
+        '/'+re.escape(STABLE_REPOSITORY)+r'/releases/download/v\d+\.\d+\.\d+/DEV_index\.json',parsed.path) is not None)
     def request():
-        with urllib.request.urlopen(req, timeout=15 if _cancel_event is not None else 60,context=update_ssl_context()) as response:
+        transport_checkpoint(url)
+        request_url=url
+        headers={'User-Agent':'BIOL-DKB-Updater/1.0','Accept':'application/vnd.github+json'}
+        if mutable_index:
+            # A mutable release index can retain a failing/expired redirect in
+            # intermediate caches. Refresh only this exact official endpoint,
+            # on every bounded retry; all downstream hash checks still apply.
+            query=[(k,v) for k,v in urllib.parse.parse_qsl(parsed.query,keep_blank_values=True) if k!='_biol_index']
+            query.append(('_biol_index',uuid.uuid4().hex))
+            request_url=urllib.parse.urlunsplit(parsed._replace(query=urllib.parse.urlencode(query)))
+            headers.update({'Accept':'application/octet-stream','Cache-Control':'no-cache','Pragma':'no-cache'})
+        req=urllib.request.Request(request_url,headers=headers)
+        with urllib.request.urlopen(req, timeout=network_timeout(),context=update_ssl_context()) as response:
             if urllib.parse.urlparse(response.url).scheme != 'https':
                 raise ValueError('Insecure redirect rejected')
             chunks=[]
@@ -832,7 +972,38 @@ def download(url):
                 chunks.append(chunk)
             download_checkpoint()
             return b''.join(chunks)
-    return retry_download(request)
+    return retry_download(request,index_swap=mutable_index,source_url=url)
+
+
+def download(url):
+    parsed=urllib.parse.urlsplit(url)
+    metadata=parsed.path.endswith('.json') or (parsed.hostname=='api.github.com' and '/releases' in parsed.path)
+    if not metadata or getattr(_request_local,'root',None) is None:return _download_uncached(url)
+    ttl=3 if parsed.path.endswith('/DEV_index.json') else 120
+    key=url;owner=False
+    while True:
+        download_checkpoint()
+        with _shared.lock:
+            entry=_shared.cache.get(key)
+            if entry and time.monotonic()-entry[0]<ttl:
+                _shared.cache.move_to_end(key);return entry[1]
+            event=_shared.inflight.get(key)
+            if event is None:event=_shared.inflight[key]=threading.Event();owner=True
+        if owner:break
+        event.wait(min(.1,network_timeout()))
+    try:
+        data=_download_uncached(url)
+        try:json.loads(data);valid_json=True
+        except (ValueError,UnicodeError):valid_json=False
+        if valid_json and len(data)<=16*1024*1024:
+            with _shared.lock:
+                _shared.cache[key]=(time.monotonic(),data)
+                while len(_shared.cache)>32 or sum(len(v[1]) for v in _shared.cache.values())>16*1024*1024:
+                    _shared.cache.popitem(last=False)
+        return data
+    finally:
+        with _shared.lock:
+            _shared.inflight.pop(key,None);event.set()
 
 
 def version_key(value):
@@ -853,10 +1024,12 @@ class RemoteDelta(io.RawIOBase):
 
     def _range(self,start,end):
         download_checkpoint()
+        _request_local.network_stage='archive_range'
         req=urllib.request.Request(self.url,headers={'User-Agent':'BIOL-DKB-Updater/1.0',
             'Range':f'bytes={start}-{end}','Accept-Encoding':'identity'})
         def request():
-            with urllib.request.urlopen(req,timeout=15 if _cancel_event is not None else 60,context=update_ssl_context()) as response:
+            transport_checkpoint(self.url)
+            with urllib.request.urlopen(req,timeout=network_timeout(),context=update_ssl_context()) as response:
                 if urllib.parse.urlparse(response.url).scheme!='https':raise ValueError('Insecure redirect')
                 match=re.fullmatch(r'bytes (\d+)-(\d+)/(\d+)',response.headers.get('Content-Range',''))
                 if response.status!=206 or not match or (int(match[1]),int(match[2]))!=(start,end):
@@ -869,7 +1042,7 @@ class RemoteDelta(io.RawIOBase):
                 if len(data)>end-start+1:raise ValueError('Invalid delta range length')
                 self.length=length
                 return data
-        return retry_download(request)
+        return retry_download(request,source_url=self.url)
 
     def seekable(self):return True
     def readable(self):return True
@@ -887,7 +1060,8 @@ class RemoteDelta(io.RawIOBase):
 
 def release_documents(release,cfg):
     assets={a['name']:a['browser_download_url'] for a in release['assets']}
-    meta_data=download(assets['release.json']);meta=json.loads(meta_data)
+    meta_data=(json.dumps(release['catalog_metadata']).encode() if 'catalog_metadata' in release else download(assets['release.json']));meta=json.loads(meta_data)
+    assets=public_assets(release,meta)
     if (meta.get('contract'),meta.get('project'),meta.get('repository'),meta.get('tag'))!=(
             'biol-project-update-v1',cfg['project'],cfg['repository'],release['tag_name']):
         raise ValueError('Release identity mismatch')
@@ -902,15 +1076,93 @@ def release_documents(release,cfg):
 
 
 STABLE_REPOSITORY='stupid42sr-lang/DKB_Auto_Updater'
+# Existing DEV anchor verified as published/non-prerelease; publication still
+# checks it through the authenticated publisher. Avoid one anonymous API call
+# per PC to recheck this immutable, explicitly pinned release identity.
+VERIFIED_DEV_ANCHORS={'v0.6.12':413494923}
+
+
+def stable_history(cfg,meta=None,release=None):
+    if meta and meta.get('history_catalog'):
+        record=meta['history_catalog'];name=record.get('name')
+        if name!='DKB_history.json' or not re.fullmatch('[0-9a-f]{64}',str(record.get('sha256',''))):
+            raise ValueError('Invalid stable history catalog identity')
+        tag=meta['tag']
+        url='https://github.com/'+cfg['repository']+'/releases/download/'+tag+'/'+name
+        data=download(url)
+        if hashlib.sha256(data).hexdigest()!=record['sha256']:raise ValueError('History catalog SHA256 mismatch')
+        catalog=json.loads(data)
+        if (catalog.get('contract')!='dkb-stable-history-v1' or catalog.get('repository')!=cfg['repository']
+                or not isinstance(catalog.get('releases'),list) or len(catalog['releases'])>2000):
+            raise ValueError('Invalid stable history catalog')
+        result=[];seen=set()
+        for item in catalog['releases']:
+            tag=item.get('tag_name','')
+            if (not re.fullmatch(r'v?\d+\.\d+\.\d+',tag) or tag in seen
+                    or item.get('draft') is not False or item.get('prerelease') is not False):
+                raise ValueError('Invalid history release channel')
+            seen.add(tag);base='https://github.com/'+cfg['repository']+'/releases/download/'+tag+'/'
+            for asset in item['assets']:
+                n=asset['name']
+                if not isinstance(n,str) or Path(n).name!=n or '/' in n or '\\' in n or asset['browser_download_url']!=base+urllib.parse.quote(n,safe=''):
+                    raise ValueError('Invalid history asset URL')
+            result.append(item)
+        if release is not None and release['tag_name'] not in seen:result.append(release)
+        return result
+    logging.getLogger('project_gui.DKB').info('업데이트 분석 · 단계=legacy_history_api · 공개본 카탈로그 없음',extra={'gui_suppress':True})
+    return _legacy_stable_history(cfg)
+
+
+def _legacy_stable_history(cfg):
+    releases=json.loads(download('https://api.github.com/repos/'+cfg['repository']+'/releases?per_page=100'))
+    return [r for r in releases if not r['draft'] and not r['prerelease']
+            and re.fullmatch(r'v?\d+\.\d+\.\d+',r['tag_name'])]
+
+
+def stable_latest(cfg):
+    _request_local.network_stage='discovery'
+    base='https://github.com/'+cfg['repository']+'/releases/'
+    req=urllib.request.Request(base+'latest',method='HEAD',headers={'User-Agent':'BIOL-DKB-Updater/1.0'})
+    def request():
+        transport_checkpoint(req.full_url)
+        with urllib.request.urlopen(req,timeout=network_timeout(),context=update_ssl_context()) as response:
+            return urllib.parse.urlsplit(response.url)
+    try:final=retry_download(request,source_url=req.full_url)
+    except urllib.error.HTTPError as exc:
+        if exc.code not in (404,405):raise
+        # Preserve old/no-latest endpoint compatibility without using REST for
+        # the ordinary public release check on every PC.
+        return stable_history(cfg)
+    prefix='/'+cfg['repository']+'/releases/tag/'
+    if final.scheme!='https' or final.netloc!='github.com' or not final.path.startswith(prefix):
+        raise ValueError('Invalid STABLE release redirect')
+    tag=final.path[len(prefix):]
+    if not re.fullmatch(r'v?\d+\.\d+\.\d+',tag):raise ValueError('Invalid STABLE release tag')
+    assets_base=base+'download/'+tag+'/'
+    return [dict(tag_name=tag,public_asset_base=assets_base,assets=[
+        dict(name=n,browser_download_url=assets_base+n) for n in ('release.json','package-manifest.json')])]
+
+
+def public_assets(release,meta):
+    assets={a['name']:a['browser_download_url'] for a in release['assets']}
+    if release.get('public_asset_base'):
+        for role in ('delta','full'):
+            if not meta.get(role):continue
+            name=meta[role]['name']
+            if not isinstance(name,str) or not name or Path(name).name!=name or '/' in name or '\\' in name:
+                raise ValueError('Invalid public release asset name')
+            assets[name]=release['public_asset_base']+urllib.parse.quote(name,safe='')
+    return assets
 
 
 def dev_releases(cfg):
     anchor=cfg.get('dev_anchor_tag','')
     if not re.fullmatch(r'v\d+\.\d+\.\d+',anchor):raise ValueError('Invalid DEV anchor')
     base='https://github.com/'+STABLE_REPOSITORY+'/releases/download/'+anchor+'/'
-    actual=json.loads(download('https://api.github.com/repos/'+STABLE_REPOSITORY+'/releases/tags/'+anchor))
-    if actual['tag_name']!=anchor or actual['draft'] or actual['prerelease']:
-        raise ValueError('DEV anchor is not an existing published STABLE release')
+    if anchor not in VERIFIED_DEV_ANCHORS:
+        actual=json.loads(download('https://api.github.com/repos/'+STABLE_REPOSITORY+'/releases/tags/'+anchor))
+        if actual['tag_name']!=anchor or actual['draft'] or actual['prerelease']:
+            raise ValueError('DEV anchor is not an existing published STABLE release')
     index=json.loads(download(base+'DEV_index.json'))
     if (index.get('contract')!='dkb-dev-assets-v1' or index.get('repository')!=STABLE_REPOSITORY
             or index.get('anchor_tag')!=anchor or not isinstance(index.get('builds'),list)
@@ -976,22 +1228,31 @@ def update_source(install):
 
 
 def inspect_release(install):
+    with update_request(install,'check',120):return _inspect_release(install)
+
+
+def _inspect_release(install):
     """Read-only structured check; safe while the app holds its instance mutex."""
     cfg = update_source(install)
+    # Small independent jitter spreads simultaneous fleet checks without a
+    # shared service, lock, token, timer or background worker.
+    delay=random.uniform(0,2)
+    if _cancel_event is not None:
+        if _cancel_event.wait(delay):download_checkpoint()
+    else:time.sleep(delay)
     old = installed_manifest(install)
     if old['project'] != cfg['project']:
         raise ValueError('Install project mismatch')
     if cfg['channel']=='DEV':
         choices=dev_releases(cfg)
     else:
-        releases = json.loads(download('https://api.github.com/repos/' + cfg['repository'] + '/releases?per_page=100'))
-        choices = [r for r in releases if not r['draft'] and not r['prerelease']
-                   and re.fullmatch(r'v?\d+\.\d+\.\d+',r['tag_name'])]
+        choices=stable_latest(cfg)
     if not choices:
         raise ValueError('No permitted published release')
     release = max(choices,key=lambda r:version_key(r['tag_name']))
     assets = {a['name']: a['browser_download_url'] for a in release['assets']}
     meta_data=download(assets['release.json']);meta=json.loads(meta_data)
+    assets=public_assets(release,meta)
     if meta.get('contract') != 'biol-project-update-v1' or meta['project'] != cfg['project'] or meta['repository'] != cfg['repository'] or meta['tag'] != release['tag_name']:
         raise ValueError('Release identity mismatch')
     if version_key(meta['version'])!=version_key(release['tag_name']):
@@ -1034,13 +1295,67 @@ def inspect_release(install):
 
 
 def prepare_update(install):
+    with update_request(install,'prepare',1200):
+        prepared=_prepare_update(install)
+        try:
+            verify_prepared_update(install,prepared)
+            return prepared
+        except BaseException:
+            shutil.rmtree(prepared['download_dir'],ignore_errors=True);raise
+
+
+def verify_prepared_update(install,prepared,*,final_check=False):
+    """Read-only preflight. Backup rotation/staging belong exclusively to apply()."""
+    root=managed_root(install);old=installed_manifest(root)
+    download_checkpoint()
+    if digest(root/manifest_name(root))!=prepared['installed_manifest_sha256']:
+        raise ValueError('Installed baseline changed after download')
+    if update_source(install)!=prepared['update_source']:raise ValueError('Update channel changed')
+    # apply() immediately repeats ZIP/file verification under app_closed. At
+    # this final gate check only identity/baseline, avoiding a third full scan.
+    if final_check:return True
+    archive=Path(prepared['archive'])
+    if digest(archive)!=prepared['sha256']:raise ValueError('ZIP SHA256 mismatch')
+    marker=BUNDLE_MANIFEST if old.get('contract')==BUNDLE_CONTRACT else 'package-manifest.json'
+    with zipfile.ZipFile(archive) as z:
+        names=z.namelist()
+        if len({n.casefold() for n in names})!=len(names):raise ValueError('Duplicate ZIP paths')
+        new=json.loads(z.read(marker))
+        if new.get('project')!=old['project']:raise ValueError('Project mismatch')
+        if old.get('contract')==BUNDLE_CONTRACT and (new.get('contract')!=BUNDLE_CONTRACT or new.get('app_dir')!='DKB_Auto'):
+            raise ValueError('Invalid bundle update')
+        if any(user_file(n) for n in (*new['files'],*new.get('removed',[]))):raise ValueError('User files cannot be updated or deleted')
+        removed={n for n in set(old['files'])-set(new['files']) if not user_file(n)}
+        if removed!=set(new.get('removed',[])):raise ValueError('Deletion manifest mismatch')
+        for name in names:
+            download_checkpoint();safe(root,name)
+            if name==marker:continue
+            data=z.read(name)
+            if name=='license.dat' and len(data)<=512 and json.loads(data.decode('utf-8-sig'))=={'license_key':''}:continue
+            if name not in new['files'] or hashlib.sha256(data).hexdigest()!=new['files'][name]:
+                raise ValueError('Delta file SHA256 mismatch: '+name)
+        for name,value in new['files'].items():
+            download_checkpoint();safe(root,name)
+            if name not in names and (old['files'].get(name)!=value or not safe(root,name).is_file() or digest(safe(root,name))!=value):
+                raise ValueError('Verified replacement missing: '+name)
+    return True
+
+
+def _prepare_update(install):
     result=inspect_release(install)
     if result['state']!='available':raise ValueError('Project delta is not applicable: '+result['state'])
     root=managed_root(install)
-    backup_optional=prepare_workspace(root, preserve_damaged=True) is False
-    backup,stage,lock=workspace(root)
-    if stage.exists() or lock.exists() or (backup.exists() and not backup_optional):
+    # Never archive/prune a backup, copy user files or stage the installation
+    # while its worker is running. apply() repeats these checks after shutdown.
+    backup,stage,lock=workspace(root,create=False)
+    legacy=tuple(root.with_name(root.name+s) for s in ('.update-stage','.update-lock'))
+    if (stage.exists() or lock.exists() or any((backup.parent/n).exists() for n in ('transaction.json','transaction.tmp'))
+            or any(p.exists() for p in legacy)):
         raise RuntimeError('Previous update pending; inspect before applying')
+    unbacked=backup.parent/UNBACKED_MARKER
+    if unbacked.exists() and json.loads(unbacked.read_text(encoding='utf-8')).get('state')!='complete':
+        raise RuntimeError('Previous update interrupted; inspect before applying')
+    result=dict(result,installed_manifest_sha256=digest(root/manifest_name(root)))
     meta=result['metadata']
     old=installed_manifest(root)
     damaged=[]
@@ -1055,6 +1370,13 @@ def prepare_update(install):
         report_progress('설치 파일 복구 준비 · '+str(len(damaged))+'개')
     if result.get('direct_delta') or damaged:
         result=dict(result, repair_files=damaged)
+        if result['update_source']['channel']=='STABLE' and result.get('release_source',{}).get('public_asset_base'):
+            # Historical sources are needed only for actual old/damaged
+            # installs, never for the Manager's read-only batch check.
+            choices=stable_history(result['update_source'],result['metadata'],result['release_source'])
+            choices=[r for r in choices if version_key(r['tag_name'])<=version_key(result['version'])]
+            if choices:
+                result['release_candidates']=choices;result['repair_candidates']=choices
         # Latest verified release is also a file source when the baseline matches.
         if damaged and result.get('repair_candidates'):
             result['release_candidates']=result['repair_candidates']
